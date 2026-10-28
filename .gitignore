@@ -1,0 +1,12 @@
+# Rust build output
+/target
+
+# Backing stores / local test mounts (never commit real data or indexes)
+/store
+/mnt
+*.cloakstore
+
+# Editor / OS cruft
+*.swp
+.DS_Store
+Thumbs.db

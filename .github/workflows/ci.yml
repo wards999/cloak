@@ -1,0 +1,64 @@
+name: CI
+
+# Lean workflow: build the portable core + run the unit tests on all three OSes,
+# and compile each mount adapter on its native, correctly-toolchained runner.
+# No code signing and no live-mount integration test (those want a real desktop
+# and certs); CI proves the code compiles everywhere and the engine is correct.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The engine, crypto, index and key handling — identical everywhere.
+  core:
+    name: Core + tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build core
+        run: cargo build --verbose
+      - name: Run tests
+        run: cargo test --verbose
+
+  # The fuser adapter (macOS/Linux). We compile it on Linux where libfuse3 is a
+  # clean apt install; the same source is what macOS uses with macFUSE/FUSE-T.
+  mount-fuser:
+    name: fuser adapter (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libfuse3
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config
+      - name: Build mount adapter
+        run: cargo build --features mount --bin cloak-mount --verbose
+
+  # The WinFsp adapter. This is the whole reason for CI: windows-latest ships the
+  # MSVC toolchain, so the adapter compiles here with ZERO local MSVC install.
+  winmount:
+    name: WinFsp adapter (Windows, MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable # defaults to x86_64-pc-windows-msvc here
+      - uses: Swatinem/rust-cache@v2
+      - name: Install WinFsp (runtime + SDK headers)
+        run: choco install winfsp -y --no-progress
+      - name: Point bindgen at libclang
+        shell: bash
+        run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+      - name: Build WinFsp adapter
+        run: cargo build --features winfsp --bin cloak-winmount --verbose
