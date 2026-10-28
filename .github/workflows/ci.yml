@@ -86,5 +86,13 @@ jobs:
       - name: Point bindgen at libclang
         shell: bash
         run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
-      - name: Build WinFsp adapter
-        run: cargo build --features winfsp --bin cloak-winmount --verbose
+      - name: Build Windows binaries (release)
+        run: cargo build --release --features winfsp --bin cloak --bin cloak-winmount --verbose
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloak-windows
+          path: |
+            target/release/cloak.exe
+            target/release/cloak-winmount.exe
+          retention-days: 7
