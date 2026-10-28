@@ -364,7 +364,11 @@ mod imp {
             .case_sensitive_search(false)
             .unicode_on_disk(true)
             .persistent_acls(false)
-            .file_info_timeout(1000);
+            // No metadata caching: file managers (Explorer, Directory Opus) must
+            // see created/renamed/deleted entries immediately on re-enumeration.
+            // A non-zero timeout serves a stale listing for that long, so new
+            // folders appear late (Explorer) or not at all (Opus).
+            .file_info_timeout(0);
 
         let context = CloakWinFs {
             store: Mutex::new(store),
