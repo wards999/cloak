@@ -84,10 +84,25 @@ def create_store(path, password):
         raise RuntimeError((proc.stderr or "could not create drive").strip())
 
 
+def used_drive_letters():
+    """Authoritative set of in-use drive letters (Windows), via GetLogicalDrives
+    — catches reserved and disconnected-network letters that Path.exists misses."""
+    if not IS_WIN:
+        return set()
+    try:
+        import ctypes
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        return {f"{chr(ord('A') + i)}:" for i in range(26) if mask & (1 << i)}
+    except Exception:
+        # Fall back to a filesystem probe.
+        return {f"{c}:" for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if Path(f"{c}\\").exists()}
+
+
 def free_drive_letters():
     if not IS_WIN:
         return []
-    return [f"{c}:" for c in "DEFGHIJKLMNOPQRSTUVWXYZ" if not Path(f"{c}\\").exists()]
+    used = used_drive_letters()
+    return [f"{c}:" for c in "DEFGHIJKLMNOPQRSTUVWXYZ" if f"{c}:" not in used]
 
 
 def load_drives():
@@ -354,6 +369,8 @@ class DrivesInterface(QWidget):
 
     def unlock(self, drive):
         letters = free_drive_letters()
+        if IS_WIN and not letters:
+            return self.err("No free drive letters available. Free one and try again.")
         dlg = UnlockDialog(self.win, drive["name"], drive["path"], letters)
         if not dlg.exec():
             return
@@ -364,7 +381,12 @@ class DrivesInterface(QWidget):
             return self.err(str(e))
 
         if IS_WIN:
-            mp = dlg.combo.currentText() if dlg.combo else "X:"
+            mp = dlg.combo.currentText() if dlg.combo else ""
+            if not mp:
+                return self.err("Choose a drive letter.")
+            # Re-check right before mounting — it may have been taken meanwhile.
+            if mp in used_drive_letters():
+                return self.err(f"{mp} is no longer free — pick another and try again.")
         else:
             mp = str(Path.home() / "cloak-mnt" / drive["name"])
             Path(mp).mkdir(parents=True, exist_ok=True)
