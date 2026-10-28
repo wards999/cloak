@@ -1,23 +1,19 @@
 //! Windows live mount via WinFsp.
 //!
-//! This is the Windows counterpart to `mount.rs` (fuser). It implements WinFsp's
-//! `FileSystemContext` over the same `Store`, so the obfuscation + header/footer
-//! crypto are identical — only the driver glue differs.
+//! Implements WinFsp's `FileSystemContext` over the `Store`, exposing the full
+//! folder tree: directories stay directories, nested paths resolve, and the
+//! obfuscation + header/footer crypto are the engine's, unchanged.
 //!
-//! BUILD REQUIREMENTS (important):
-//!   * The WinFsp runtime installed (`winget install WinFsp.WinFsp`).
-//!   * The **MSVC** Rust toolchain: `x86_64-pc-windows-msvc`. The `winfsp` crate
-//!     delay-loads `winfsp-x64.dll` using an MSVC-only linker feature and panics
-//!     on any other target, so it does NOT build under the GNU toolchain.
-//!     Install Visual Studio Build Tools (Desktop C++), then:
-//!         rustup toolchain install stable-x86_64-pc-windows-msvc
-//!         cargo +stable-x86_64-pc-windows-msvc build --features winfsp --bin cloak-winmount
-//!   * LLVM/libclang on PATH (winfsp-sys generates bindings with bindgen).
+//! BUILD REQUIREMENTS:
+//!   * WinFsp runtime installed (`winget install WinFsp.WinFsp`).
+//!   * The **MSVC** Rust toolchain (`x86_64-pc-windows-msvc`) + Visual Studio
+//!     Build Tools + LLVM. The CI Windows job builds this; a standalone local
+//!     LLVM may fail to parse the Windows SDK headers (see project history).
 //!
-//! Usage (the GUI launches this; it can also be run by hand):
-//!     set CLOAK_PASSPHRASE=...     & cloak-winmount <backing-store-dir> <X:>
-//! The process holds the mount until stdin receives a line (Enter) or the
-//! process is terminated (how the GUI unmounts).
+//! Usage (the GUI launches this; it also runs by hand):
+//!     set CLOAK_PASSPHRASE=...  &  cloak-winmount <backing-store-dir> <X:>
+//! The process holds the mount until stdin hits EOF (Enter / closed) or it is
+//! terminated. It needs winfsp-x64.dll reachable (WinFsp's bin dir on PATH).
 
 #[cfg(not(all(feature = "winfsp", windows)))]
 fn main() {
@@ -34,7 +30,7 @@ fn main() {
 
 #[cfg(all(feature = "winfsp", windows))]
 mod imp {
-    use cloak::Store;
+    use cloak::{Metadata, Store};
     use std::sync::Mutex;
     use widestring::U16CStr;
     use winfsp::filesystem::{
@@ -47,28 +43,24 @@ mod imp {
 
     const ATTR_DIRECTORY: u32 = 0x10; // FILE_ATTRIBUTE_DIRECTORY
     const ATTR_NORMAL: u32 = 0x80; // FILE_ATTRIBUTE_NORMAL
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001; // create_options bit = "make a directory"
 
-    /// What an open handle refers to in our flat namespace.
+    /// An open handle, carrying the logical path it refers to.
     enum Handle {
         Root,
-        File { name: String },
+        Dir(String),
+        File(String),
     }
 
     struct CloakWinFs {
         // WinFsp calls back on many threads with only &self, so the mutable Store
-        // lives behind a Mutex (the engine's ops are quick; this is simple and safe).
+        // lives behind a Mutex (engine ops are quick; simple and safe).
         store: Mutex<Store>,
     }
 
     impl CloakWinFs {
-        fn size_of(&self, name: &str) -> Option<u64> {
-            self.store
-                .lock()
-                .unwrap()
-                .metadata(name)
-                .ok()
-                .flatten()
-                .map(|m| m.size)
+        fn meta(&self, path: &str) -> Option<Metadata> {
+            self.store.lock().unwrap().metadata(path).ok().flatten()
         }
     }
 
@@ -76,18 +68,13 @@ mod imp {
         FspError::IO(std::io::ErrorKind::NotFound)
     }
 
-    /// Parse a WinFsp path ("\", "\name"). Returns None for nested paths, since
-    /// the store is a single flat directory.
-    fn parse(file_name: &U16CStr) -> Option<Handle> {
-        let s = file_name.to_string_lossy();
-        let s = s.trim_start_matches('\\');
-        if s.is_empty() {
-            return Some(Handle::Root);
-        }
-        if s.contains('\\') {
-            return None; // no subdirectories
-        }
-        Some(Handle::File { name: s.to_string() })
+    /// Convert a WinFsp path (`\`, `\name`, `\a\b`) to a logical store path
+    /// (`""`, `name`, `a/b`).
+    fn path_of(file_name: &U16CStr) -> String {
+        file_name
+            .to_string_lossy()
+            .trim_start_matches('\\')
+            .replace('\\', "/")
     }
 
     fn fill_file_info(info: &mut FileInfo, size: u64, is_dir: bool) {
@@ -105,19 +92,21 @@ mod imp {
             _security_descriptor: Option<&mut [std::ffi::c_void]>,
             _resolve: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
         ) -> FspResult<FileSecurity> {
-            match parse(file_name) {
-                Some(Handle::Root) => Ok(FileSecurity {
-                    reparse: false,
-                    sz_security_descriptor: 0,
-                    attributes: ATTR_DIRECTORY,
-                }),
-                Some(Handle::File { name }) if self.size_of(&name).is_some() => Ok(FileSecurity {
-                    reparse: false,
-                    sz_security_descriptor: 0,
-                    attributes: ATTR_NORMAL,
-                }),
-                _ => Err(not_found()),
-            }
+            let path = path_of(file_name);
+            let attributes = if path.is_empty() {
+                ATTR_DIRECTORY
+            } else {
+                match self.meta(&path) {
+                    Some(m) if m.is_dir => ATTR_DIRECTORY,
+                    Some(_) => ATTR_NORMAL,
+                    None => return Err(not_found()),
+                }
+            };
+            Ok(FileSecurity {
+                reparse: false,
+                sz_security_descriptor: 0,
+                attributes,
+            })
         }
 
         fn open(
@@ -127,15 +116,19 @@ mod imp {
             _granted_access: FILE_ACCESS_RIGHTS,
             file_info: &mut OpenFileInfo,
         ) -> FspResult<Self::FileContext> {
-            match parse(file_name) {
-                Some(Handle::Root) => {
+            let path = path_of(file_name);
+            if path.is_empty() {
+                fill_file_info(file_info.as_mut(), 0, true);
+                return Ok(Handle::Root);
+            }
+            match self.meta(&path) {
+                Some(m) if m.is_dir => {
                     fill_file_info(file_info.as_mut(), 0, true);
-                    Ok(Handle::Root)
+                    Ok(Handle::Dir(path))
                 }
-                Some(Handle::File { name }) => {
-                    let size = self.size_of(&name).ok_or_else(not_found)?;
-                    fill_file_info(file_info.as_mut(), size, false);
-                    Ok(Handle::File { name })
+                Some(m) => {
+                    fill_file_info(file_info.as_mut(), m.size, false);
+                    Ok(Handle::File(path))
                 }
                 None => Err(not_found()),
             }
@@ -149,9 +142,9 @@ mod imp {
             file_info: &mut FileInfo,
         ) -> FspResult<()> {
             match context {
-                Handle::Root => fill_file_info(file_info, 0, true),
-                Handle::File { name } => {
-                    let size = self.size_of(name).ok_or_else(not_found)?;
+                Handle::Root | Handle::Dir(_) => fill_file_info(file_info, 0, true),
+                Handle::File(path) => {
+                    let size = self.meta(path).ok_or_else(not_found)?.size;
                     fill_file_info(file_info, size, false);
                 }
             }
@@ -164,36 +157,32 @@ mod imp {
             buffer: &mut [u8],
             offset: u64,
         ) -> FspResult<u32> {
-            let Handle::File { name } = context else {
+            let Handle::File(path) = context else {
                 return Err(not_found());
             };
-            let data = self
-                .store
-                .lock()
-                .unwrap()
-                .read_at(name, offset, buffer.len())?;
+            let data = self.store.lock().unwrap().read_at(path, offset, buffer.len())?;
             buffer[..data.len()].copy_from_slice(&data);
             Ok(data.len() as u32)
         }
 
         fn read_directory(
             &self,
-            _context: &Self::FileContext,
+            context: &Self::FileContext,
             _pattern: Option<&U16CStr>,
             marker: DirMarker,
             buffer: &mut [u8],
         ) -> FspResult<u32> {
-            // Build the entry list: ".", ".." then every file, continuing after
-            // `marker` if WinFsp is paging through a large directory.
-            let names = self.store.lock().unwrap().list();
+            let dir = match context {
+                Handle::Root => String::new(),
+                Handle::Dir(p) => p.clone(),
+                Handle::File(_) => return Err(not_found()),
+            };
+            let children = self.store.lock().unwrap().list_dir(&dir).unwrap_or_default();
             let mut entries: Vec<(String, bool, u64)> = vec![
                 (".".to_string(), true, 0),
                 ("..".to_string(), true, 0),
             ];
-            for n in names {
-                let size = self.size_of(&n).unwrap_or(0);
-                entries.push((n, false, size));
-            }
+            entries.extend(children);
 
             let resume_after = marker.inner_as_cstr().map(|c| c.to_string_lossy());
             let mut began = resume_after.is_none();
@@ -211,18 +200,18 @@ mod imp {
                 dir_info.set_name(&name)?;
                 fill_file_info(dir_info.file_info_mut(), size, is_dir);
                 if !dir_info.append_to_buffer(buffer, &mut cursor) {
-                    // Buffer full: stop; WinFsp will call again with a marker.
-                    return Ok(cursor);
+                    return Ok(cursor); // buffer full; WinFsp will resume with a marker
                 }
             }
             DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
             Ok(cursor)
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn create(
             &self,
             file_name: &U16CStr,
-            _create_options: u32,
+            create_options: u32,
             _granted_access: FILE_ACCESS_RIGHTS,
             _file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
             _security_descriptor: Option<&[std::ffi::c_void]>,
@@ -231,12 +220,22 @@ mod imp {
             _extra_is_reparse: bool,
             file_info: &mut OpenFileInfo,
         ) -> FspResult<Self::FileContext> {
-            let Some(Handle::File { name }) = parse(file_name) else {
+            let path = path_of(file_name);
+            if path.is_empty() {
                 return Err(FspError::IO(std::io::ErrorKind::InvalidInput));
-            };
-            self.store.lock().unwrap().create(&name)?;
-            fill_file_info(file_info.as_mut(), 0, false);
-            Ok(Handle::File { name })
+            }
+            let mut store = self.store.lock().unwrap();
+            if create_options & FILE_DIRECTORY_FILE != 0 {
+                store.mkdir(&path)?;
+                drop(store);
+                fill_file_info(file_info.as_mut(), 0, true);
+                Ok(Handle::Dir(path))
+            } else {
+                store.create(&path)?;
+                drop(store);
+                fill_file_info(file_info.as_mut(), 0, false);
+                Ok(Handle::File(path))
+            }
         }
 
         fn write(
@@ -248,17 +247,17 @@ mod imp {
             _constrained_io: bool,
             file_info: &mut FileInfo,
         ) -> FspResult<u32> {
-            let Handle::File { name } = context else {
+            let Handle::File(path) = context else {
                 return Err(not_found());
             };
             let mut store = self.store.lock().unwrap();
             let at = if write_to_eof {
-                store.metadata(name).ok().flatten().map(|m| m.size).unwrap_or(0)
+                store.metadata(path).ok().flatten().map(|m| m.size).unwrap_or(0)
             } else {
                 offset
             };
-            store.write_at(name, at, buffer)?;
-            let size = store.metadata(name).ok().flatten().map(|m| m.size).unwrap_or(0);
+            store.write_at(path, at, buffer)?;
+            let size = store.metadata(path).ok().flatten().map(|m| m.size).unwrap_or(0);
             drop(store);
             fill_file_info(file_info, size, false);
             Ok(buffer.len() as u32)
@@ -271,10 +270,10 @@ mod imp {
             _set_allocation_size: bool,
             file_info: &mut FileInfo,
         ) -> FspResult<()> {
-            let Handle::File { name } = context else {
+            let Handle::File(path) = context else {
                 return Err(not_found());
             };
-            self.store.lock().unwrap().truncate(name, new_size)?;
+            self.store.lock().unwrap().truncate(path, new_size)?;
             fill_file_info(file_info, new_size, false);
             Ok(())
         }
@@ -288,11 +287,24 @@ mod imp {
             _extra_buffer: Option<&[u8]>,
             file_info: &mut FileInfo,
         ) -> FspResult<()> {
-            let Handle::File { name } = context else {
+            let Handle::File(path) = context else {
                 return Err(not_found());
             };
-            self.store.lock().unwrap().truncate(name, 0)?;
+            self.store.lock().unwrap().truncate(path, 0)?;
             fill_file_info(file_info, 0, false);
+            Ok(())
+        }
+
+        fn rename(
+            &self,
+            _context: &Self::FileContext,
+            file_name: &U16CStr,
+            new_file_name: &U16CStr,
+            _replace_if_exists: bool,
+        ) -> FspResult<()> {
+            let old = path_of(file_name);
+            let new = path_of(new_file_name);
+            self.store.lock().unwrap().rename_path(&old, &new)?;
             Ok(())
         }
 
@@ -302,25 +314,25 @@ mod imp {
             _file_name: &U16CStr,
             _delete_file: bool,
         ) -> FspResult<()> {
-            // Allow deletion of files (not the root); actual removal happens in
-            // cleanup when the delete flag is set.
             match context {
-                Handle::File { .. } => Ok(()),
                 Handle::Root => Err(FspError::IO(std::io::ErrorKind::PermissionDenied)),
+                _ => Ok(()),
             }
         }
 
         fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
             if flags & (FspCleanupDelete as u32) != 0 {
-                if let Handle::File { name } = context {
-                    let _ = self.store.lock().unwrap().remove(name);
+                let path = match context {
+                    Handle::File(p) | Handle::Dir(p) => Some(p),
+                    Handle::Root => None,
+                };
+                if let Some(p) = path {
+                    let _ = self.store.lock().unwrap().remove(p);
                 }
             }
         }
 
         fn get_volume_info(&self, out: &mut VolumeInfo) -> FspResult<()> {
-            // Report a nominal volume size; the backing store's real capacity is
-            // whatever the underlying disk has.
             out.total_size = 1 << 40; // 1 TiB nominal
             out.free_size = 1 << 39; // 512 GiB nominal
             out.set_volume_label("cloak");
