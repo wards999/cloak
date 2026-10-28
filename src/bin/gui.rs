@@ -1,14 +1,12 @@
-//! cloak-gui — cross-platform controller with two modes:
+//! cloak-gui — a password-protected drive manager.
 //!
-//!   * **Mount drive** — a thin controller over the platform mount adapter
-//!     (`cloak-winmount` / `cloak-mount`). Needs the FUSE/WinFsp driver.
-//!   * **Browse (no driver)** — opens the store *in-process* via the engine and
-//!     acts as a small file manager: navigate folders, import/extract files,
-//!     make folders, rename, delete. Needs no driver and no code signing — the
-//!     most portable way to use a store.
+//! Flow: **Home** → *Create new drive* (set a password) or *Open existing drive*
+//! (enter the password) → the **open drive**, where you can:
+//!   * browse/import/extract files in-process (no driver, no signing), and
+//!   * mount it as a real drive letter / folder (needs the FUSE/WinFsp driver).
 //!
-//! The passphrase is cleared from its field as soon as it's used (handed to the
-//! mount child, or used to open the in-process store).
+//! The password is held in memory only while a drive is open (it's needed to
+//! spawn the mount process) and cleared when the drive is closed.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -22,7 +20,7 @@ fn main() {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([560.0, 480.0])
+            .with_inner_size([580.0, 520.0])
             .with_resizable(true),
         ..Default::default()
     };
@@ -41,8 +39,6 @@ mod imp {
     use std::process::{Child, Command, Stdio};
 
     const REGION: u64 = 64 * 1024;
-
-    // ---- adapter discovery (mount mode) ---------------------------------
 
     fn adapter_name() -> &'static str {
         if cfg!(windows) {
@@ -69,7 +65,6 @@ mod imp {
         format!("{home}/cloak-mnt")
     }
 
-    /// Free drive letters as `"X:"` strings (Windows only; empty elsewhere).
     fn free_drive_letters() -> Vec<String> {
         #[cfg(windows)]
         {
@@ -99,7 +94,6 @@ mod imp {
         }
     }
 
-    /// Join a logical directory path with a child name.
     fn join(dir: &str, name: &str) -> String {
         if dir.is_empty() {
             name.to_string()
@@ -108,7 +102,6 @@ mod imp {
         }
     }
 
-    /// Parent of a logical path (empty string = root).
     fn parent_of(path: &str) -> String {
         match path.rfind('/') {
             Some(i) => path[..i].to_string(),
@@ -117,38 +110,34 @@ mod imp {
     }
 
     #[derive(PartialEq, Eq)]
-    enum Mode {
-        Mount,
-        Browse,
-    }
-
-    enum Status {
-        Idle,
-        Mounted { at: String },
-        Error(String),
+    enum Screen {
+        Home,
+        Create,
+        Open,
+        Drive,
     }
 
     pub struct CloakGui {
-        mode: Mode,
+        screen: Screen,
+        location: String,
+        password: String,
+        confirm: String,
+        msg: String,
 
-        // Shared store folder + passphrase inputs.
-        store_dir: String,
-        passphrase: String,
-
-        // Mount mode.
-        mount_point: String,
-        status: Status,
-        child: Option<Child>,
-        drive_letters: Vec<String>,
-
-        // Browse mode (in-process store).
         opened: Option<Store>,
+
+        // Browser state.
         cwd: String,
         entries: Vec<(String, bool, u64)>,
         selected: Option<String>,
         new_folder: String,
         rename_to: String,
-        browse_msg: String,
+
+        // Mount state.
+        mount_point: String,
+        child: Option<Child>,
+        drive_letters: Vec<String>,
+        mount_status: String,
     }
 
     impl Default for CloakGui {
@@ -165,103 +154,100 @@ mod imp {
                 default_mount_point()
             };
             Self {
-                mode: Mode::Mount,
-                store_dir: String::new(),
-                passphrase: String::new(),
-                mount_point,
-                status: Status::Idle,
-                child: None,
-                drive_letters,
+                screen: Screen::Home,
+                location: String::new(),
+                password: String::new(),
+                confirm: String::new(),
+                msg: String::new(),
                 opened: None,
                 cwd: String::new(),
                 entries: Vec::new(),
                 selected: None,
                 new_folder: String::new(),
                 rename_to: String::new(),
-                browse_msg: String::new(),
+                mount_point,
+                child: None,
+                drive_letters,
+                mount_status: String::new(),
             }
         }
     }
 
     impl CloakGui {
-        // ---- mount mode ---------------------------------------------------
-
-        fn is_mounted(&self) -> bool {
-            self.child.is_some()
+        fn reset_inputs(&mut self) {
+            self.location.clear();
+            self.password.clear();
+            self.confirm.clear();
+            self.msg.clear();
         }
 
-        fn mount(&mut self) {
-            if self.store_dir.trim().is_empty() {
-                self.status = Status::Error("Choose a backing-store folder.".into());
-                return;
-            }
-            if self.passphrase.is_empty() {
-                self.status = Status::Error("Enter a passphrase.".into());
-                return;
-            }
-            let adapter = locate_adapter();
-            let spawn = Command::new(&adapter)
-                .arg(&self.store_dir)
-                .arg(&self.mount_point)
-                .env("CLOAK_PASSPHRASE", &self.passphrase)
-                .stdin(Stdio::piped())
-                .spawn();
-            self.passphrase.clear();
-            match spawn {
-                Ok(child) => {
-                    self.status = Status::Mounted {
-                        at: self.mount_point.clone(),
-                    };
-                    self.child = Some(child);
-                }
-                Err(e) => {
-                    self.status = Status::Error(format!(
-                        "Couldn't launch {}: {e}. Is the adapter built for this platform?",
-                        adapter.display()
-                    ));
-                }
-            }
-        }
+        // ---- drive lifecycle ---------------------------------------------
 
-        fn unmount(&mut self) {
-            if let Some(mut child) = self.child.take() {
-                drop(child.stdin.take());
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            self.status = Status::Idle;
-        }
-
-        // ---- browse mode --------------------------------------------------
-
-        fn open_store(&mut self) {
-            if self.store_dir.trim().is_empty() {
-                self.browse_msg = "Choose a backing-store folder.".into();
+        fn create_drive(&mut self) {
+            if self.location.trim().is_empty() {
+                self.msg = "Choose a location for the drive.".into();
                 return;
             }
-            if self.passphrase.is_empty() {
-                self.browse_msg = "Enter a passphrase.".into();
+            if self.password.is_empty() {
+                self.msg = "Enter a password.".into();
                 return;
             }
-            match Store::open_with_passphrase(&self.store_dir, &self.passphrase, REGION) {
+            if self.password != self.confirm {
+                self.msg = "Passwords don't match.".into();
+                return;
+            }
+            match Store::create_with_passphrase(&self.location, &self.password, REGION) {
                 Ok(store) => {
                     self.opened = Some(store);
-                    self.cwd = String::new();
+                    self.cwd.clear();
                     self.selected = None;
-                    self.browse_msg.clear();
+                    self.confirm.clear();
+                    self.msg.clear();
+                    self.mount_status.clear();
+                    self.screen = Screen::Drive;
                     self.refresh();
                 }
-                Err(e) => self.browse_msg = format!("Couldn't open store: {e}"),
+                Err(e) => self.msg = format!("Couldn't create drive: {e}"),
             }
-            self.passphrase.clear();
         }
 
-        fn close_store(&mut self) {
+        fn open_drive(&mut self) {
+            if self.location.trim().is_empty() {
+                self.msg = "Choose the drive location.".into();
+                return;
+            }
+            if self.password.is_empty() {
+                self.msg = "Enter the password.".into();
+                return;
+            }
+            match Store::open_with_passphrase(&self.location, &self.password) {
+                Ok(store) => {
+                    self.opened = Some(store);
+                    self.cwd.clear();
+                    self.selected = None;
+                    self.msg.clear();
+                    self.mount_status.clear();
+                    self.screen = Screen::Drive;
+                    self.refresh();
+                }
+                // e.g. "wrong password" or "no drive here".
+                Err(e) => self.msg = format!("{e}"),
+            }
+        }
+
+        fn close_drive(&mut self) {
+            self.unmount();
             self.opened = None;
             self.entries.clear();
             self.selected = None;
             self.cwd.clear();
+            self.password.clear();
+            self.confirm.clear();
+            self.msg.clear();
+            self.screen = Screen::Home;
         }
+
+        // ---- browser ------------------------------------------------------
 
         fn refresh(&mut self) {
             let cwd = self.cwd.clone();
@@ -269,7 +255,6 @@ mod imp {
                 Some(s) => s.list_dir(&cwd).unwrap_or_default(),
                 None => Vec::new(),
             };
-            // Folders first, then alphabetical.
             list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.to_lowercase().cmp(&b.0.to_lowercase())));
             self.entries = list;
         }
@@ -288,17 +273,14 @@ mod imp {
 
         fn import_file(&mut self, src: PathBuf) {
             let cwd = self.cwd.clone();
-            let name = match src.file_name().and_then(|s| s.to_str()) {
-                Some(n) => n.to_string(),
-                None => {
-                    self.browse_msg = "Bad source filename.".into();
-                    return;
-                }
+            let Some(name) = src.file_name().and_then(|s| s.to_str()).map(str::to_owned) else {
+                self.msg = "Bad source filename.".into();
+                return;
             };
             let data = match std::fs::read(&src) {
                 Ok(d) => d,
                 Err(e) => {
-                    self.browse_msg = format!("Read failed: {e}");
+                    self.msg = format!("Read failed: {e}");
                     return;
                 }
             };
@@ -309,10 +291,10 @@ mod imp {
             });
             match result {
                 Some(Ok(())) => {
-                    self.browse_msg = format!("Imported {name}");
+                    self.msg = format!("Imported {name}");
                     self.refresh();
                 }
-                Some(Err(e)) => self.browse_msg = format!("Import failed: {e}"),
+                Some(Err(e)) => self.msg = format!("Import failed: {e}"),
                 None => {}
             }
         }
@@ -326,10 +308,10 @@ mod imp {
             match self.opened.as_mut().map(|s| s.mkdir(&path)) {
                 Some(Ok(())) => {
                     self.new_folder.clear();
-                    self.browse_msg = format!("Created folder {name}");
+                    self.msg = format!("Created folder {name}");
                     self.refresh();
                 }
-                Some(Err(e)) => self.browse_msg = format!("mkdir failed: {e}"),
+                Some(Err(e)) => self.msg = format!("mkdir failed: {e}"),
                 None => {}
             }
         }
@@ -339,13 +321,12 @@ mod imp {
                 return;
             };
             let path = join(&self.cwd, &name);
-            let data = self.opened.as_ref().map(|s| s.read_all(&path));
-            match data {
+            match self.opened.as_ref().map(|s| s.read_all(&path)) {
                 Some(Ok(bytes)) => match std::fs::write(&dest, bytes) {
-                    Ok(()) => self.browse_msg = format!("Extracted to {}", dest.display()),
-                    Err(e) => self.browse_msg = format!("Write failed: {e}"),
+                    Ok(()) => self.msg = format!("Extracted to {}", dest.display()),
+                    Err(e) => self.msg = format!("Write failed: {e}"),
                 },
-                Some(Err(e)) => self.browse_msg = format!("Extract failed: {e}"),
+                Some(Err(e)) => self.msg = format!("Extract failed: {e}"),
                 None => {}
             }
         }
@@ -358,10 +339,10 @@ mod imp {
             match self.opened.as_mut().map(|s| s.remove(&path)) {
                 Some(Ok(())) => {
                     self.selected = None;
-                    self.browse_msg = format!("Deleted {name}");
+                    self.msg = format!("Deleted {name}");
                     self.refresh();
                 }
-                Some(Err(e)) => self.browse_msg = format!("Delete failed: {e}"),
+                Some(Err(e)) => self.msg = format!("Delete failed: {e}"),
                 None => {}
             }
         }
@@ -380,28 +361,59 @@ mod imp {
                 Some(Ok(())) => {
                     self.selected = Some(new.clone());
                     self.rename_to.clear();
-                    self.browse_msg = format!("Renamed to {new}");
+                    self.msg = format!("Renamed to {new}");
                     self.refresh();
                 }
-                Some(Err(e)) => self.browse_msg = format!("Rename failed: {e}"),
+                Some(Err(e)) => self.msg = format!("Rename failed: {e}"),
                 None => {}
+            }
+        }
+
+        // ---- mount --------------------------------------------------------
+
+        fn is_mounted(&self) -> bool {
+            self.child.is_some()
+        }
+
+        fn mount(&mut self) {
+            let adapter = locate_adapter();
+            let spawn = Command::new(&adapter)
+                .arg(&self.location)
+                .arg(&self.mount_point)
+                .env("CLOAK_PASSPHRASE", &self.password)
+                .stdin(Stdio::piped())
+                .spawn();
+            match spawn {
+                Ok(child) => {
+                    self.child = Some(child);
+                    self.mount_status = format!("Mounted at {}", self.mount_point);
+                }
+                Err(e) => {
+                    self.mount_status = format!(
+                        "Couldn't launch {} ({e}). Is the mount driver/adapter installed?",
+                        adapter.display()
+                    )
+                }
+            }
+        }
+
+        fn unmount(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                drop(child.stdin.take());
+                let _ = child.kill();
+                let _ = child.wait();
+                self.mount_status = "Unmounted.".into();
             }
         }
     }
 
     impl eframe::App for CloakGui {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading("cloak");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.mode, Mode::Mount, "Mount drive");
-                    ui.selectable_value(&mut self.mode, Mode::Browse, "Browse (no driver)");
-                });
-                ui.separator();
-                match self.mode {
-                    Mode::Mount => self.mount_ui(ui),
-                    Mode::Browse => self.browse_ui(ui),
-                }
+            egui::CentralPanel::default().show(ctx, |ui| match self.screen {
+                Screen::Home => self.home_ui(ui),
+                Screen::Create => self.create_ui(ui),
+                Screen::Open => self.open_ui(ui),
+                Screen::Drive => self.drive_ui(ui),
             });
         }
 
@@ -411,144 +423,125 @@ mod imp {
     }
 
     impl CloakGui {
-        fn mount_ui(&mut self, ui: &mut egui::Ui) {
-            let mounted = self.is_mounted();
-            egui::Grid::new("mount_fields")
-                .num_columns(3)
-                .spacing([8.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label("Backing store");
-                    ui.add_enabled(
-                        !mounted,
-                        egui::TextEdit::singleline(&mut self.store_dir)
-                            .hint_text("folder with the obfuscated blobs"),
-                    );
-                    if ui.add_enabled(!mounted, egui::Button::new("Browse…")).clicked() {
-                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                            self.store_dir = dir.display().to_string();
-                        }
-                    }
-                    ui.end_row();
-
-                    ui.label("Mount point");
-                    if cfg!(windows) {
-                        let letters = self.drive_letters.clone();
-                        ui.add_enabled_ui(!mounted, |ui| {
-                            egui::ComboBox::from_id_source("drive_letter")
-                                .selected_text(if self.mount_point.is_empty() {
-                                    "(choose)".to_owned()
-                                } else {
-                                    self.mount_point.clone()
-                                })
-                                .show_ui(ui, |ui| {
-                                    for d in &letters {
-                                        ui.selectable_value(&mut self.mount_point, d.clone(), d);
-                                    }
-                                });
-                        });
-                        if ui.add_enabled(!mounted, egui::Button::new("Refresh")).clicked() {
-                            self.drive_letters = free_drive_letters();
-                        }
-                    } else {
-                        ui.add_enabled(
-                            !mounted,
-                            egui::TextEdit::singleline(&mut self.mount_point)
-                                .hint_text("/path/to/mnt"),
-                        );
-                        ui.label("");
-                    }
-                    ui.end_row();
-
-                    ui.label("Passphrase");
-                    ui.add_enabled(
-                        !mounted,
-                        egui::TextEdit::singleline(&mut self.passphrase)
-                            .password(true)
-                            .hint_text("unlocks the store"),
-                    );
-                    ui.label("");
-                    ui.end_row();
-                });
-
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!mounted, egui::Button::new("Mount")).clicked() {
-                    self.mount();
+        fn home_ui(&mut self, ui: &mut egui::Ui) {
+            ui.add_space(28.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("cloak");
+                ui.label("Encrypted drives, unlocked by password.");
+                ui.add_space(20.0);
+                if ui
+                    .add_sized([220.0, 36.0], egui::Button::new("Create new drive"))
+                    .clicked()
+                {
+                    self.reset_inputs();
+                    self.screen = Screen::Create;
                 }
-                if ui.add_enabled(mounted, egui::Button::new("Unmount")).clicked() {
-                    self.unmount();
+                ui.add_space(10.0);
+                if ui
+                    .add_sized([220.0, 36.0], egui::Button::new("Open existing drive"))
+                    .clicked()
+                {
+                    self.reset_inputs();
+                    self.screen = Screen::Open;
                 }
             });
+        }
+
+        fn location_row(&mut self, ui: &mut egui::Ui, hint: &str) {
+            ui.label("Location");
+            ui.add(egui::TextEdit::singleline(&mut self.location).hint_text(hint));
+            if ui.button("Choose…").clicked() {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.location = dir.display().to_string();
+                }
+            }
+            ui.end_row();
+        }
+
+        fn create_ui(&mut self, ui: &mut egui::Ui) {
+            ui.heading("Create new drive");
+            ui.add_space(8.0);
+            egui::Grid::new("create").num_columns(3).spacing([8.0, 8.0]).show(ui, |ui| {
+                self.location_row(ui, "empty folder to hold the new drive");
+                ui.label("Password");
+                ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                ui.label("");
+                ui.end_row();
+                ui.label("Confirm");
+                ui.add(egui::TextEdit::singleline(&mut self.confirm).password(true));
+                ui.label("");
+                ui.end_row();
+            });
             ui.add_space(10.0);
-            ui.separator();
-            match &self.status {
-                Status::Idle => {
-                    ui.colored_label(egui::Color32::GRAY, "Not mounted.");
+            ui.horizontal(|ui| {
+                if ui.button("Create").clicked() {
+                    self.create_drive();
                 }
-                Status::Mounted { at } => {
-                    ui.colored_label(egui::Color32::from_rgb(40, 160, 80), format!("Mounted at {at}."));
+                if ui.button("Back").clicked() {
+                    self.reset_inputs();
+                    self.screen = Screen::Home;
                 }
-                Status::Error(msg) => {
-                    ui.colored_label(egui::Color32::from_rgb(200, 70, 70), msg);
+            });
+            self.msg_line(ui);
+        }
+
+        fn open_ui(&mut self, ui: &mut egui::Ui) {
+            ui.heading("Open existing drive");
+            ui.add_space(8.0);
+            egui::Grid::new("open").num_columns(3).spacing([8.0, 8.0]).show(ui, |ui| {
+                self.location_row(ui, "folder of an existing drive");
+                ui.label("Password");
+                ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                ui.label("");
+                ui.end_row();
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Open").clicked() {
+                    self.open_drive();
                 }
+                if ui.button("Back").clicked() {
+                    self.reset_inputs();
+                    self.screen = Screen::Home;
+                }
+            });
+            self.msg_line(ui);
+        }
+
+        fn msg_line(&self, ui: &mut egui::Ui) {
+            if !self.msg.is_empty() {
+                ui.add_space(6.0);
+                ui.colored_label(egui::Color32::from_rgb(200, 70, 70), &self.msg);
             }
         }
 
-        fn browse_ui(&mut self, ui: &mut egui::Ui) {
-            if self.opened.is_none() {
-                // Open form.
-                egui::Grid::new("browse_open")
-                    .num_columns(3)
-                    .spacing([8.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("Backing store");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.store_dir)
-                                .hint_text("store folder"),
-                        );
-                        if ui.button("Browse…").clicked() {
-                            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                                self.store_dir = dir.display().to_string();
-                            }
-                        }
-                        ui.end_row();
-
-                        ui.label("Passphrase");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.passphrase)
-                                .password(true)
-                                .hint_text("unlocks the store"),
-                        );
-                        ui.label("");
-                        ui.end_row();
-                    });
-                ui.add_space(8.0);
-                if ui.button("Open").clicked() {
-                    self.open_store();
-                }
-                ui.add_space(6.0);
-                ui.small("No driver and no signing needed — files are read and written directly.");
-                if !self.browse_msg.is_empty() {
-                    ui.colored_label(egui::Color32::from_rgb(200, 70, 70), &self.browse_msg);
-                }
+        fn drive_ui(&mut self, ui: &mut egui::Ui) {
+            ui.horizontal(|ui| {
+                ui.heading("Drive");
+                ui.monospace(&self.location);
+            });
+            if ui.button("Close drive").clicked() {
+                self.close_drive();
                 return;
             }
+            ui.separator();
+            self.browse_section(ui);
+            ui.add_space(6.0);
+            ui.separator();
+            egui::CollapsingHeader::new("Mount as a drive")
+                .default_open(false)
+                .show(ui, |ui| self.mount_section(ui));
+        }
 
-            // Opened: toolbar + listing.
-            ui.horizontal(|ui| {
-                if ui.button("Close").clicked() {
-                    self.close_store();
-                    return;
-                }
-                ui.separator();
-                let crumb = if self.cwd.is_empty() { "/" } else { self.cwd.as_str() };
-                ui.label(format!("Location: {crumb}"));
-            });
-
+        fn browse_section(&mut self, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 if ui.add_enabled(!self.cwd.is_empty(), egui::Button::new("Up")).clicked() {
                     self.navigate_up();
                 }
+                let crumb = if self.cwd.is_empty() { "/" } else { self.cwd.as_str() };
+                ui.monospace(crumb);
+            });
+            ui.horizontal(|ui| {
                 if ui.button("Import file…").clicked() {
                     if let Some(src) = rfd::FileDialog::new().pick_file() {
                         self.import_file(src);
@@ -559,17 +552,16 @@ mod imp {
                         .desired_width(120.0)
                         .hint_text("new folder"),
                 );
-                if ui.button("Create").clicked() {
+                if ui.button("Create folder").clicked() {
                     self.make_folder();
                 }
             });
 
             ui.separator();
 
-            // Entry list.
             let entries = self.entries.clone();
             let mut navigate: Option<String> = None;
-            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
                 if entries.is_empty() {
                     ui.weak("(empty)");
                 }
@@ -600,16 +592,14 @@ mod imp {
 
             ui.separator();
 
-            // Actions on the selected entry.
             let sel = self.selected.clone();
+            let is_file = sel
+                .as_ref()
+                .and_then(|n| self.entries.iter().find(|(name, _, _)| name == n))
+                .map(|(_, is_dir, _)| !*is_dir)
+                .unwrap_or(false);
+            let has_sel = sel.is_some();
             ui.horizontal(|ui| {
-                let has_sel = sel.is_some();
-                let is_file = sel
-                    .as_ref()
-                    .and_then(|n| self.entries.iter().find(|(name, _, _)| name == n))
-                    .map(|(_, is_dir, _)| !*is_dir)
-                    .unwrap_or(false);
-
                 if ui.add_enabled(is_file, egui::Button::new("Extract…")).clicked() {
                     if let Some(name) = &sel {
                         if let Some(dest) = rfd::FileDialog::new().set_file_name(name).save_file() {
@@ -631,13 +621,55 @@ mod imp {
                 }
             });
 
-            ui.add_space(6.0);
-            if let Some(name) = &sel {
-                ui.small(format!("Selected: {name}"));
+            if !self.msg.is_empty() {
+                ui.add_space(4.0);
+                ui.colored_label(egui::Color32::from_rgb(90, 90, 90), &self.msg);
             }
-            if !self.browse_msg.is_empty() {
-                ui.colored_label(egui::Color32::from_rgb(90, 90, 90), &self.browse_msg);
+        }
+
+        fn mount_section(&mut self, ui: &mut egui::Ui) {
+            let mounted = self.is_mounted();
+            ui.horizontal(|ui| {
+                ui.label("Mount point");
+                if cfg!(windows) {
+                    let letters = self.drive_letters.clone();
+                    ui.add_enabled_ui(!mounted, |ui| {
+                        egui::ComboBox::from_id_source("drive_letter")
+                            .selected_text(if self.mount_point.is_empty() {
+                                "(choose)".to_owned()
+                            } else {
+                                self.mount_point.clone()
+                            })
+                            .show_ui(ui, |ui| {
+                                for d in &letters {
+                                    ui.selectable_value(&mut self.mount_point, d.clone(), d);
+                                }
+                            });
+                    });
+                    if ui.add_enabled(!mounted, egui::Button::new("Refresh")).clicked() {
+                        self.drive_letters = free_drive_letters();
+                    }
+                } else {
+                    ui.add_enabled(
+                        !mounted,
+                        egui::TextEdit::singleline(&mut self.mount_point).hint_text("/path/to/mnt"),
+                    );
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!mounted, egui::Button::new("Mount")).clicked() {
+                    self.mount();
+                }
+                if ui.add_enabled(mounted, egui::Button::new("Unmount")).clicked() {
+                    self.unmount();
+                }
+            });
+            if !self.mount_status.is_empty() {
+                ui.add_space(4.0);
+                ui.weak(&self.mount_status);
             }
+            ui.add_space(2.0);
+            ui.small("Mounting needs the FUSE/WinFsp driver installed. Browsing above needs nothing.");
         }
     }
 }

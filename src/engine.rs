@@ -16,13 +16,20 @@
 
 use crate::boring::generate_unique;
 use crate::crypto::{protected_ranges, transform_region, Key, Nonce, NONCE_LEN};
-use crate::key::{self, Salt, SALT_LEN};
+use crate::key::{self, SALT_LEN};
 use crate::manifest::{Child, Kind, Manifest};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::cmp::{max, min};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+/// Known token encrypted under the derived key at create time; decrypting it on
+/// open is how we tell a correct password from a wrong one. This is a
+/// usability/security trade: it lets an attacker with the store test password
+/// guesses offline, but Argon2id makes each guess expensive, and "wrong
+/// password" feedback is table stakes for a drive app.
+const VERIFY_TOKEN: &[u8] = b"cloak-verify-v1";
 
 /// Store-wide metadata persisted at the backing root (reserved name, distinct
 /// from a directory manifest).
@@ -31,6 +38,9 @@ struct StoreMeta {
     version: u32,
     salt: [u8; SALT_LEN],
     region: u64,
+    /// Nonce + ciphertext of VERIFY_TOKEN under the derived key.
+    verifier_nonce: [u8; NONCE_LEN],
+    verifier: Vec<u8>,
 }
 
 /// What a path points at.
@@ -79,10 +89,10 @@ impl Store {
         })
     }
 
-    /// Open (or create) a store whose key is derived from a passphrase. On first
-    /// use a random salt + the region are written to `meta.json`; later opens
-    /// reuse the stored salt/region and ignore the `region` argument.
-    pub fn open_with_passphrase(
+    /// Create a brand-new drive protected by `passphrase`. Errors if a drive
+    /// already exists at `backing_dir` (so Create never clobbers an existing
+    /// one). Writes the salt, region, and an encrypted verifier token.
+    pub fn create_with_passphrase(
         backing_dir: impl AsRef<Path>,
         passphrase: &str,
         region: u64,
@@ -90,23 +100,55 @@ impl Store {
         let backing_dir = backing_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&backing_dir)?;
         let meta_path = backing_dir.join("meta.json");
-
-        let (salt, region): (Salt, u64) = if meta_path.exists() {
-            let meta: StoreMeta = serde_json::from_slice(&std::fs::read(&meta_path)?)?;
-            (meta.salt, meta.region)
-        } else {
-            let salt = key::random_salt();
-            let meta = StoreMeta {
-                version: 1,
-                salt,
-                region,
-            };
-            std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta)?)?;
-            (salt, region)
-        };
-
+        if meta_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a drive already exists here",
+            ));
+        }
+        let salt = key::random_salt();
         let derived = key::derive_key(passphrase, &salt);
+
+        let mut verifier_nonce = [0u8; NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut verifier_nonce);
+        let mut verifier = VERIFY_TOKEN.to_vec();
+        transform_region(&derived, &verifier_nonce, 0, &mut verifier);
+
+        let meta = StoreMeta {
+            version: 1,
+            salt,
+            region,
+            verifier_nonce,
+            verifier,
+        };
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta)?)?;
         Self::open(backing_dir, derived, region)
+    }
+
+    /// Open an existing drive. Errors if there is no drive at `backing_dir`
+    /// ("no drive here"), or if the passphrase is wrong ("wrong password"),
+    /// checked against the verifier token before any data is touched.
+    pub fn open_with_passphrase(
+        backing_dir: impl AsRef<Path>,
+        passphrase: &str,
+    ) -> io::Result<Self> {
+        let backing_dir = backing_dir.as_ref().to_path_buf();
+        let meta_path = backing_dir.join("meta.json");
+        if !meta_path.exists() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no drive here"));
+        }
+        let meta: StoreMeta = serde_json::from_slice(&std::fs::read(&meta_path)?)?;
+        let derived = key::derive_key(passphrase, &meta.salt);
+
+        let mut check = meta.verifier.clone();
+        transform_region(&derived, &meta.verifier_nonce, 0, &mut check);
+        if check != VERIFY_TOKEN {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "wrong password",
+            ));
+        }
+        Self::open(backing_dir, derived, meta.region)
     }
 
     // ---- path resolution -------------------------------------------------
@@ -540,20 +582,30 @@ mod tests {
     }
 
     #[test]
-    fn passphrase_nested_roundtrip_and_wrong_key() {
+    fn create_open_wrong_password_and_missing() {
         let d = tempdir().unwrap();
         {
-            let mut s = Store::open_with_passphrase(d.path(), "right", 64).unwrap();
+            let mut s = Store::create_with_passphrase(d.path(), "right", 64).unwrap();
             s.mkdir("vault").unwrap();
             s.create("vault/note.txt").unwrap();
             s.write_at("vault/note.txt", 0, b"top secret contents").unwrap();
         }
-        let good = Store::open_with_passphrase(d.path(), "right", 64).unwrap();
+        // Creating again where a drive already exists must fail (never clobber).
+        assert!(Store::create_with_passphrase(d.path(), "right", 64).is_err());
+
+        // Right password opens and reads.
+        let good = Store::open_with_passphrase(d.path(), "right").unwrap();
         assert_eq!(good.read_all("vault/note.txt").unwrap(), b"top secret contents");
 
-        // Wrong passphrase can't even decrypt the root manifest, so `vault`
-        // won't resolve.
-        let bad = Store::open_with_passphrase(d.path(), "wrong", 64).unwrap();
-        assert!(bad.list().is_empty() || bad.read_all("vault/note.txt").is_err());
+        // Wrong password is rejected up front by the verifier.
+        let bad = Store::open_with_passphrase(d.path(), "wrong");
+        assert_eq!(bad.err().map(|e| e.kind()), Some(io::ErrorKind::PermissionDenied));
+
+        // Opening where no drive exists errors.
+        let empty = tempdir().unwrap();
+        assert_eq!(
+            Store::open_with_passphrase(empty.path(), "x").err().map(|e| e.kind()),
+            Some(io::ErrorKind::NotFound)
+        );
     }
 }

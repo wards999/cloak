@@ -343,8 +343,7 @@ mod imp {
         });
 
         let _init = winfsp_init_or_die();
-        let store = Store::open_with_passphrase(&store_dir, &passphrase, 64 * 1024)
-            .expect("open store");
+        let store = Store::open_with_passphrase(&store_dir, &passphrase).expect("open store");
 
         let mut params = VolumeParams::new();
         params

@@ -343,10 +343,7 @@ mod imp {
             eprintln!("set CLOAK_PASSPHRASE to the store passphrase");
             std::process::exit(2);
         });
-        let region = 64 * 1024;
-
-        let store =
-            Store::open_with_passphrase(&store_dir, &passphrase, region).expect("open store");
+        let store = Store::open_with_passphrase(&store_dir, &passphrase).expect("open store");
         let fs = CloakFs::new(store);
 
         let options = vec![
