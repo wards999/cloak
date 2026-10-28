@@ -318,8 +318,13 @@ class DrivesInterface(QWidget):
     def refresh(self):
         while self.cards.count():
             item = self.cards.takeAt(0)
-            if item:
-                item.widget().deleteLater()
+            if item is None:
+                continue
+            # FlowLayout.takeAt may return the widget directly or a QLayoutItem.
+            w = item.widget() if hasattr(item, "widget") else item
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
         cbs = {"unlock": self.unlock, "lock": self.lock, "open": self.open_drive, "remove": self.remove}
         for d in self.drives:
             self.cards.addWidget(DriveCard(d, self.mounts.get(d["path"]), cbs))
