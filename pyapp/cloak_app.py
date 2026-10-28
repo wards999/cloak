@@ -271,8 +271,11 @@ class DrivesInterface(QWidget):
         lay = QVBoxLayout(self); lay.setContentsMargins(36, 28, 36, 28); lay.setSpacing(16)
         head = QHBoxLayout()
         head.addWidget(TitleLabel("Your drives", self)); head.addStretch(1)
+        addbtn = PushButton(FIF.FOLDER, "Add existing", self)
+        addbtn.clicked.connect(self.import_existing)
         newbtn = PrimaryPushButton(FIF.ADD, "New drive", self)
         newbtn.clicked.connect(self.create_drive)
+        head.addWidget(addbtn)
         head.addWidget(newbtn)
         lay.addLayout(head)
         lay.addWidget(CaptionLabel("Unlock a drive to mount it — then work with your files in Explorer.", self))
@@ -317,6 +320,24 @@ class DrivesInterface(QWidget):
         save_drives(self.drives)
         self.refresh()
         self.ok(f"Created “{name}”. Unlock it to mount.")
+
+    def import_existing(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select an existing cloak drive folder")
+        if not folder:
+            return
+        if not (Path(folder) / "meta.json").exists():
+            return self.err("That folder isn't a cloak drive (no drive metadata found).")
+        if any(d["path"] == folder for d in self.drives):
+            return self.err("That drive is already in your list.")
+        dlg = NameDialog(self.win, "Add existing drive", "Name for this drive")
+        dlg.edit.setText(Path(folder).name)
+        if not dlg.exec():
+            return
+        name = dlg.edit.text().strip() or Path(folder).name
+        self.drives.insert(0, {"name": name, "path": folder})
+        save_drives(self.drives)
+        self.refresh()
+        self.ok(f"Added “{name}”. Unlock it to mount.")
 
     def unlock(self, drive):
         letters = free_drive_letters()
