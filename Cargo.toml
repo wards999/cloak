@@ -60,7 +60,9 @@ fuser = { version = "0.14.0", optional = true }
 # NOTE: winfsp links via MSVC delay-load and requires the MSVC toolchain
 # (x86_64-pc-windows-msvc) + Visual Studio Build Tools; it will not build under
 # the GNU toolchain.
-winfsp = { version = "0.11.0", optional = true }
+# default features pull in `nightly` (strict-provenance => #![feature], which
+# only nightly rustc allows). Use the crate's `stable` bundle instead.
+winfsp = { version = "0.11.0", optional = true, default-features = false, features = ["stable", "windows-rs"] }
 winfsp-sys = { version = "0.2", optional = true }
 widestring = "1.1.0"
 
