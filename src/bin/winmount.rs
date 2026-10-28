@@ -37,13 +37,43 @@ mod imp {
         DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, VolumeInfo,
         WideNameInfo,
     };
-    use winfsp::host::{FileSystemHost, VolumeParams};
+    use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
+    use winfsp::notify::{NotifyInfo, Notifier, NotifyingFileSystemContext};
     use winfsp::{winfsp_init_or_die, FspError, Result as FspResult};
     use winfsp_sys::{FspCleanupDelete, FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
     const ATTR_DIRECTORY: u32 = 0x10; // FILE_ATTRIBUTE_DIRECTORY
     const ATTR_NORMAL: u32 = 0x80; // FILE_ATTRIBUTE_NORMAL
     const FILE_DIRECTORY_FILE: u32 = 0x0000_0001; // create_options bit = "make a directory"
+
+    // Change-notification filters/actions (winnt.h). We publish these to WinFsp so
+    // that file managers watching a directory (Explorer, Directory Opus) refresh
+    // the instant something is created/renamed/deleted, instead of only on a manual
+    // refresh or Explorer's slow fallback poll.
+    const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
+    const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x0000_0002;
+    const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
+    const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
+
+    const FILE_ACTION_ADDED: u32 = 0x0000_0001;
+    const FILE_ACTION_REMOVED: u32 = 0x0000_0002;
+    const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
+    const FILE_ACTION_RENAMED_OLD_NAME: u32 = 0x0000_0004;
+    const FILE_ACTION_RENAMED_NEW_NAME: u32 = 0x0000_0005;
+
+    // How often (ms) the notify timer drains queued change events. WinFsp forbids
+    // sending notifications from inside an operation callback, so operations queue
+    // events and this timer flushes them from outside any operation. 100ms reads as
+    // instant while keeping timer wakeups cheap.
+    const NOTIFY_INTERVAL_MS: u32 = 100;
+
+    /// One queued filesystem-change notification: the mount-relative path in WinFsp
+    /// form (`\name`, `\dir\sub`), plus the change filter and action.
+    struct NotifyEvent {
+        path: String,
+        filter: u32,
+        action: u32,
+    }
 
     /// An open handle, carrying the logical path it refers to.
     enum Handle {
@@ -56,11 +86,49 @@ mod imp {
         // WinFsp calls back on many threads with only &self, so the mutable Store
         // lives behind a Mutex (engine ops are quick; simple and safe).
         store: Mutex<Store>,
+        // Change events produced by operations, drained by the notify timer.
+        pending: Mutex<Vec<NotifyEvent>>,
     }
 
     impl CloakWinFs {
         fn meta(&self, path: &str) -> Option<Metadata> {
             self.store.lock().unwrap().metadata(path).ok().flatten()
+        }
+
+        /// Queue a change event for the notify timer. `path` is a logical store
+        /// path (`name`, `dir/sub`); it is converted to WinFsp's mount-relative
+        /// form (`\name`, `\dir\sub`).
+        fn enqueue(&self, path: &str, filter: u32, action: u32) {
+            let winfsp_path = format!("\\{}", path.replace('/', "\\"));
+            self.pending.lock().unwrap().push(NotifyEvent {
+                path: winfsp_path,
+                filter,
+                action,
+            });
+        }
+    }
+
+    // WinFsp calls `should_notify`/`notify` from a timer thread, outside any file
+    // operation, which is the only safe place to publish notifications.
+    impl NotifyingFileSystemContext<Vec<NotifyEvent>> for CloakWinFs {
+        fn should_notify(&self) -> Option<Vec<NotifyEvent>> {
+            let mut q = self.pending.lock().unwrap();
+            if q.is_empty() {
+                None
+            } else {
+                Some(std::mem::take(&mut *q))
+            }
+        }
+
+        fn notify(&self, events: Vec<NotifyEvent>, notifier: &Notifier) {
+            for ev in events {
+                let mut info = NotifyInfo::<255>::new();
+                info.filter = ev.filter;
+                info.action = ev.action;
+                if info.set_name(&ev.path).is_ok() {
+                    notifier.notify(&info);
+                }
+            }
         }
     }
 
@@ -228,11 +296,13 @@ mod imp {
             if create_options & FILE_DIRECTORY_FILE != 0 {
                 store.mkdir(&path)?;
                 drop(store);
+                self.enqueue(&path, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_ACTION_ADDED);
                 fill_file_info(file_info.as_mut(), 0, true);
                 Ok(Handle::Dir(path))
             } else {
                 store.create(&path)?;
                 drop(store);
+                self.enqueue(&path, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_ACTION_ADDED);
                 fill_file_info(file_info.as_mut(), 0, false);
                 Ok(Handle::File(path))
             }
@@ -259,6 +329,11 @@ mod imp {
             store.write_at(path, at, buffer)?;
             let size = store.metadata(path).ok().flatten().map(|m| m.size).unwrap_or(0);
             drop(store);
+            self.enqueue(
+                path,
+                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                FILE_ACTION_MODIFIED,
+            );
             fill_file_info(file_info, size, false);
             Ok(buffer.len() as u32)
         }
@@ -274,6 +349,11 @@ mod imp {
                 return Err(not_found());
             };
             self.store.lock().unwrap().truncate(path, new_size)?;
+            self.enqueue(
+                path,
+                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                FILE_ACTION_MODIFIED,
+            );
             fill_file_info(file_info, new_size, false);
             Ok(())
         }
@@ -297,7 +377,7 @@ mod imp {
 
         fn rename(
             &self,
-            _context: &Self::FileContext,
+            context: &Self::FileContext,
             file_name: &U16CStr,
             new_file_name: &U16CStr,
             _replace_if_exists: bool,
@@ -305,6 +385,12 @@ mod imp {
             let old = path_of(file_name);
             let new = path_of(new_file_name);
             self.store.lock().unwrap().rename_path(&old, &new)?;
+            let filter = match context {
+                Handle::File(_) => FILE_NOTIFY_CHANGE_FILE_NAME,
+                _ => FILE_NOTIFY_CHANGE_DIR_NAME,
+            };
+            self.enqueue(&old, filter, FILE_ACTION_RENAMED_OLD_NAME);
+            self.enqueue(&new, filter, FILE_ACTION_RENAMED_NEW_NAME);
             Ok(())
         }
 
@@ -322,12 +408,15 @@ mod imp {
 
         fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
             if flags & (FspCleanupDelete as u32) != 0 {
-                let path = match context {
-                    Handle::File(p) | Handle::Dir(p) => Some(p),
+                let path_and_filter = match context {
+                    Handle::File(p) => Some((p, FILE_NOTIFY_CHANGE_FILE_NAME)),
+                    Handle::Dir(p) => Some((p, FILE_NOTIFY_CHANGE_DIR_NAME)),
                     Handle::Root => None,
                 };
-                if let Some(p) = path {
-                    let _ = self.store.lock().unwrap().remove(p);
+                if let Some((p, filter)) = path_and_filter {
+                    if self.store.lock().unwrap().remove(p).is_ok() {
+                        self.enqueue(p, filter, FILE_ACTION_REMOVED);
+                    }
                 }
             }
         }
@@ -372,8 +461,15 @@ mod imp {
 
         let context = CloakWinFs {
             store: Mutex::new(store),
+            pending: Mutex::new(Vec::new()),
         };
-        let mut host = FileSystemHost::new(params, context).expect("create filesystem host");
+        // new_with_timer wires up the notify poll timer so queued change events are
+        // published to WinFsp (and thus to Explorer / Directory Opus) promptly.
+        let mut host = FileSystemHost::new_with_timer::<CloakWinFs, Vec<NotifyEvent>, NOTIFY_INTERVAL_MS>(
+            FileSystemParams::default_params(params),
+            context,
+        )
+        .expect("create filesystem host");
         host.mount(mount_point.as_str()).expect("mount");
         host.start().expect("start dispatcher");
         println!("mounted {store_dir} at {mount_point}; press Enter (or terminate) to unmount");
