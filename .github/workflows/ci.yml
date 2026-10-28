@@ -19,6 +19,8 @@ jobs:
   core:
     name: Core + tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # macOS runners need paid minutes; don't let them fail the whole run.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -51,6 +53,8 @@ jobs:
   gui:
     name: GUI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # macOS runners need paid minutes; don't let them fail the whole run.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
