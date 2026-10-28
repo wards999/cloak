@@ -46,6 +46,28 @@ jobs:
       - name: Build mount adapter
         run: cargo build --features mount --bin cloak-mount --verbose
 
+  # The cross-platform GUI (eframe). Linux needs GTK + windowing dev headers;
+  # macOS and Windows build out of the box.
+  gui:
+    name: GUI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GUI deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
+      - name: Build GUI
+        run: cargo build --features gui --bin cloak-gui --verbose
+
   # The WinFsp adapter. This is the whole reason for CI: windows-latest ships the
   # MSVC toolchain, so the adapter compiles here with ZERO local MSVC install.
   winmount:

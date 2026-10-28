@@ -50,8 +50,11 @@ Two more honest caveats:
 src/crypto.rs   seekable ChaCha20; encrypt first-N and last-N bytes
 src/boring.rs   boring decoy-name generator
 src/index.rs    scrambled <-> original map + per-file nonce/size (JSON)
-src/engine.rs   Store: ingest / read_at / list  (the portable core)
-src/bin/mount.rs  reference fuser read-only mount adapter (macOS/Linux)
+src/key.rs      Argon2id passphrase -> master key (key never stored)
+src/engine.rs   Store: ingest / create / write_at / truncate / read_at / remove
+src/bin/mount.rs     read-write fuser mount adapter (macOS/Linux)
+src/bin/winmount.rs  read-write WinFsp mount adapter (Windows, MSVC)
+src/bin/gui.rs       cross-platform eframe GUI (mount/unmount + passphrase)
 benches/crypto_bench.rs  full-file vs ends-only timing
 ```
 
@@ -67,23 +70,39 @@ cargo test
 # the full-file vs ends-only benchmark
 cargo bench
 
-# mount it read-only (macOS: install macFUSE first; Linux: libfuse3)
-cargo run --features mount --bin cloak-mount -- ./store ./mnt
+# the GUI (cross-platform): pick a store folder, mount point, passphrase
+cargo run --features gui --bin cloak-gui
+
+# mount via CLI (macOS: install macFUSE/FUSE-T first; Linux: libfuse3)
+CLOAK_PASSPHRASE=... cargo run --features mount --bin cloak-mount -- ./store ./mnt
 ```
 
-On **Windows**, install [WinFsp](https://winfsp.dev) and wire the same `Store`
-behind the [`winfsp`](https://crates.io/crates/winfsp) crate; the callback logic
-in `mount.rs` ports almost verbatim because WinFsp mirrors the FUSE model.
+On **Windows** the mount adapter uses [WinFsp](https://winfsp.dev) and must be
+built with the **MSVC** toolchain (the `winfsp` crate delay-loads via an
+MSVC-only linker feature; it does not build under GNU):
+
+```bash
+# needs WinFsp installed + Visual Studio Build Tools (Desktop C++) + LLVM
+cargo build --features winfsp --bin cloak-winmount
+set CLOAK_PASSPHRASE=... & cloak-winmount .\store X:
+```
+
+Don't want the local MSVC install? The GitHub Actions workflow
+(`.github/workflows/ci.yml`) compiles the WinFsp adapter on a Windows MSVC
+runner for you, and builds the core + GUI + fuser adapter across all three OSes.
 
 ## Status
 
 - [x] Seekable header/footer crypto + tests
 - [x] Boring-name generator + tests
 - [x] Lookup index with persistence + tests
-- [x] Storage engine (ingest / ranged read) + tests
-- [x] Reference read-only fuser mount adapter
+- [x] Storage engine (ingest / ranged read / write path) + tests
+- [x] Read-write fuser mount adapter (macOS/Linux)
+- [x] WinFsp mount adapter (Windows, MSVC)
+- [x] Passphrase-derived key (Argon2id); key never stored
+- [x] Cross-platform GUI (mount/unmount + passphrase)
 - [x] Full-file vs ends-only benchmark
-- [ ] Write path through the mount (currently read-only)
-- [ ] WinFsp adapter
-- [ ] Passphrase-derived key (argon2) / OS keychain instead of demo key
+- [x] GitHub Actions CI (core + adapters + GUI across 3 OSes)
+- [ ] FSKit adapter for modern macOS (kext-free; via a C-ABI core)
+- [ ] Code signing / notarization for public distribution
 - [ ] Optional per-region nonce for files > 256 GiB
