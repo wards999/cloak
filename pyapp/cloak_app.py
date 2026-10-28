@@ -222,6 +222,19 @@ class UnlockDialog(MessageBoxBase):
         self.pw.returnPressed.connect(self.yesButton.click)
 
 
+class NameDialog(MessageBoxBase):
+    def __init__(self, parent, title, placeholder):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel(title, self)
+        self.edit = LineEdit(self); self.edit.setPlaceholderText(placeholder)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.edit)
+        self.yesButton.setText("OK")
+        self.cancelButton.setText("Cancel")
+        self.widget.setMinimumWidth(360)
+        self.edit.returnPressed.connect(self.yesButton.click)
+
+
 # ---- drive card ------------------------------------------------------------
 
 class DriveCard(CardWidget):
