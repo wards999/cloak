@@ -93,7 +93,6 @@ mod imp {
             _resolve: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
         ) -> FspResult<FileSecurity> {
             let path = path_of(file_name);
-            eprintln!("TRACE sec_by_name {path:?}");
             let attributes = if path.is_empty() {
                 ATTR_DIRECTORY
             } else {
@@ -118,7 +117,6 @@ mod imp {
             file_info: &mut OpenFileInfo,
         ) -> FspResult<Self::FileContext> {
             let path = path_of(file_name);
-            eprintln!("TRACE open {path:?} opts={_create_options:#x}");
             if path.is_empty() {
                 fill_file_info(file_info.as_mut(), 0, true);
                 return Ok(Handle::Root);
@@ -223,7 +221,6 @@ mod imp {
             file_info: &mut OpenFileInfo,
         ) -> FspResult<Self::FileContext> {
             let path = path_of(file_name);
-            eprintln!("TRACE create {path:?} opts={create_options:#x}");
             if path.is_empty() {
                 return Err(FspError::IO(std::io::ErrorKind::InvalidInput));
             }
@@ -307,20 +304,16 @@ mod imp {
         ) -> FspResult<()> {
             let old = path_of(file_name);
             let new = path_of(new_file_name);
-            eprintln!("TRACE rename {old:?} -> {new:?}");
-            let r = self.store.lock().unwrap().rename_path(&old, &new);
-            eprintln!("TRACE rename result = {:?}", r.as_ref().map_err(|e| e.to_string()));
-            r?;
+            self.store.lock().unwrap().rename_path(&old, &new)?;
             Ok(())
         }
 
         fn set_delete(
             &self,
             context: &Self::FileContext,
-            file_name: &U16CStr,
-            delete_file: bool,
+            _file_name: &U16CStr,
+            _delete_file: bool,
         ) -> FspResult<()> {
-            eprintln!("TRACE set_delete {:?} del={delete_file}", path_of(file_name));
             match context {
                 Handle::Root => Err(FspError::IO(std::io::ErrorKind::PermissionDenied)),
                 _ => Ok(()),
@@ -328,7 +321,6 @@ mod imp {
         }
 
         fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
-            eprintln!("TRACE cleanup flags={flags:#x}");
             if flags & (FspCleanupDelete as u32) != 0 {
                 let path = match context {
                     Handle::File(p) | Handle::Dir(p) => Some(p),

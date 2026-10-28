@@ -537,6 +537,22 @@ mod tests {
     }
 
     #[test]
+    fn case_insensitive_lookup_and_rename() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("Hello").unwrap();
+        s.create("Hello/Note.txt").unwrap();
+        // Lookups fold case (like a Windows/macOS drive).
+        assert!(s.metadata("hello").unwrap().unwrap().is_dir);
+        assert!(s.metadata("HELLO/note.TXT").unwrap().is_some());
+        // Rename with an uppercased source — what Windows sends on rename.
+        s.rename_path("HELLO", "World").unwrap();
+        // Case is preserved in storage, so it lists as "World".
+        assert_eq!(s.list(), vec!["World".to_string()]);
+        assert!(s.metadata("world/note.txt").unwrap().is_some());
+    }
+
+    #[test]
     fn move_folder_across_parents_keeps_subtree() {
         let d = tempdir().unwrap();
         let mut s = store(d.path());

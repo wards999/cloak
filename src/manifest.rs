@@ -93,12 +93,16 @@ impl Manifest {
         std::fs::write(Self::path_in(dir), out)
     }
 
+    // Name matching is case-insensitive: a mounted drive is case-insensitive on
+    // both Windows and macOS, and the OS hands names back in varying case (e.g.
+    // Windows sends an uppercased source name on rename). Lookups fold case;
+    // the stored name keeps its original case (case-preserving).
     pub fn find(&self, real: &str) -> Option<&Child> {
-        self.children.iter().find(|c| c.real == real)
+        self.children.iter().find(|c| c.real.eq_ignore_ascii_case(real))
     }
 
     pub fn position(&self, real: &str) -> Option<usize> {
-        self.children.iter().position(|c| c.real == real)
+        self.children.iter().position(|c| c.real.eq_ignore_ascii_case(real))
     }
 
     /// The set of boring names in use here, plus the reserved manifest name, so
