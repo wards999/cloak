@@ -305,7 +305,7 @@ mod imp {
         }
 
         fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
-            if flags & FspCleanupDelete != 0 {
+            if flags & (FspCleanupDelete as u32) != 0 {
                 if let Handle::File { name } = context {
                     let _ = self.store.lock().unwrap().remove(name);
                 }
