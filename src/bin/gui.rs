@@ -1,12 +1,9 @@
-//! cloak-gui — a password-protected drive manager.
+//! cloak-gui — a password-protected drive manager (VeraCrypt-ish, much simpler).
 //!
-//! Flow: **Home** → *Create new drive* (set a password) or *Open existing drive*
-//! (enter the password) → the **open drive**, where you can:
-//!   * browse/import/extract files in-process (no driver, no signing), and
-//!   * mount it as a real drive letter / folder (needs the FUSE/WinFsp driver).
-//!
-//! The password is held in memory only while a drive is open (it's needed to
-//! spawn the mount process) and cleared when the drive is closed.
+//! Home shows a remembered list of your drives; pick one and unlock it, or
+//! create/open another. An open drive gives an in-process file browser (no
+//! driver needed) and an optional "Mount as a drive" section (needs FUSE/WinFsp).
+//! The password is held only while a drive is open and cleared on close.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -20,25 +17,88 @@ fn main() {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([580.0, 520.0])
-            .with_resizable(true),
+            .with_inner_size([600.0, 540.0])
+            .with_min_inner_size([460.0, 420.0]),
         ..Default::default()
     };
     eframe::run_native(
         "cloak",
         options,
-        Box::new(|_cc| Ok(Box::new(imp::CloakGui::default()))),
+        Box::new(|cc| {
+            imp::setup_style(&cc.egui_ctx);
+            Ok(Box::new(imp::CloakGui::default()))
+        }),
     )
 }
 
 #[cfg(feature = "gui")]
 mod imp {
     use cloak::Store;
-    use eframe::egui;
+    use eframe::egui::{self, Color32, RichText};
+    use serde::{Deserialize, Serialize};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
 
     const REGION: u64 = 64 * 1024;
+    const ACCENT: Color32 = Color32::from_rgb(123, 108, 246);
+    const BG: Color32 = Color32::from_rgb(15, 17, 22);
+    const PANEL: Color32 = Color32::from_rgb(26, 29, 36);
+    const BORDER: Color32 = Color32::from_rgb(42, 46, 56);
+    const TEXT: Color32 = Color32::from_rgb(231, 233, 238);
+    const MUTED: Color32 = Color32::from_rgb(150, 156, 168);
+    const OK_GREEN: Color32 = Color32::from_rgb(74, 200, 130);
+    const ERR_RED: Color32 = Color32::from_rgb(235, 110, 110);
+
+    /// Apply a clean dark theme: accent color, rounded widgets, roomy spacing,
+    /// slightly larger type.
+    pub fn setup_style(ctx: &egui::Context) {
+        use egui::{FontFamily, FontId, Rounding, Stroke, TextStyle};
+
+        let mut style = (*ctx.style()).clone();
+        let mut v = egui::Visuals::dark();
+        v.panel_fill = BG;
+        v.window_fill = PANEL;
+        v.extreme_bg_color = Color32::from_rgb(12, 13, 17);
+        v.override_text_color = Some(TEXT);
+        v.selection.bg_fill = ACCENT.linear_multiply(0.45_f32);
+        v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+        v.hyperlink_color = ACCENT;
+        v.window_stroke = Stroke::new(1.0_f32, BORDER);
+
+        let rounding = Rounding::same(9.0_f32);
+        for w in [
+            &mut v.widgets.noninteractive,
+            &mut v.widgets.inactive,
+            &mut v.widgets.hovered,
+            &mut v.widgets.active,
+            &mut v.widgets.open,
+        ] {
+            w.rounding = rounding;
+        }
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+        v.widgets.inactive.bg_fill = PANEL;
+        v.widgets.inactive.weak_bg_fill = PANEL;
+        v.widgets.hovered.bg_fill = Color32::from_rgb(36, 40, 49);
+        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(36, 40, 49);
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+        v.widgets.active.bg_fill = Color32::from_rgb(40, 44, 54);
+        v.window_rounding = Rounding::same(12.0_f32);
+        style.visuals = v;
+
+        style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+        style.spacing.button_padding = egui::vec2(14.0, 8.0);
+        style.text_styles = [
+            (TextStyle::Heading, FontId::new(28.0, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(15.0, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(15.0, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+            (TextStyle::Small, FontId::new(12.5, FontFamily::Proportional)),
+        ]
+        .into();
+        ctx.set_style(style);
+    }
+
+    // ---- adapter / platform helpers -------------------------------------
 
     fn adapter_name() -> &'static str {
         if cfg!(windows) {
@@ -51,9 +111,9 @@ mod imp {
     fn locate_adapter() -> PathBuf {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
-                let candidate = dir.join(adapter_name());
-                if candidate.exists() {
-                    return candidate;
+                let c = dir.join(adapter_name());
+                if c.exists() {
+                    return c;
                 }
             }
         }
@@ -109,6 +169,45 @@ mod imp {
         }
     }
 
+    fn basename(path: &str) -> String {
+        PathBuf::from(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| path.to_owned())
+    }
+
+    // ---- remembered drive list ------------------------------------------
+
+    #[derive(Clone, Serialize, Deserialize)]
+    struct DriveEntry {
+        name: String,
+        path: String,
+    }
+
+    fn config_path() -> Option<PathBuf> {
+        let base = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+        Some(PathBuf::from(base).join(".cloak").join("drives.json"))
+    }
+
+    fn load_recents() -> Vec<DriveEntry> {
+        config_path()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_recents(recents: &[DriveEntry]) {
+        if let Some(p) = config_path() {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(json) = serde_json::to_vec_pretty(recents) {
+                let _ = std::fs::write(p, json);
+            }
+        }
+    }
+
     #[derive(PartialEq, Eq)]
     enum Screen {
         Home,
@@ -123,17 +222,16 @@ mod imp {
         password: String,
         confirm: String,
         msg: String,
+        recents: Vec<DriveEntry>,
 
         opened: Option<Store>,
 
-        // Browser state.
         cwd: String,
         entries: Vec<(String, bool, u64)>,
         selected: Option<String>,
         new_folder: String,
         rename_to: String,
 
-        // Mount state.
         mount_point: String,
         child: Option<Child>,
         drive_letters: Vec<String>,
@@ -159,6 +257,7 @@ mod imp {
                 password: String::new(),
                 confirm: String::new(),
                 msg: String::new(),
+                recents: load_recents(),
                 opened: None,
                 cwd: String::new(),
                 entries: Vec::new(),
@@ -181,7 +280,14 @@ mod imp {
             self.msg.clear();
         }
 
-        // ---- drive lifecycle ---------------------------------------------
+        fn remember(&mut self) {
+            let path = self.location.clone();
+            let name = basename(&path);
+            self.recents.retain(|d| d.path != path);
+            self.recents.insert(0, DriveEntry { name, path });
+            self.recents.truncate(8);
+            save_recents(&self.recents);
+        }
 
         fn create_drive(&mut self) {
             if self.location.trim().is_empty() {
@@ -204,6 +310,7 @@ mod imp {
                     self.confirm.clear();
                     self.msg.clear();
                     self.mount_status.clear();
+                    self.remember();
                     self.screen = Screen::Drive;
                     self.refresh();
                 }
@@ -227,10 +334,10 @@ mod imp {
                     self.selected = None;
                     self.msg.clear();
                     self.mount_status.clear();
+                    self.remember();
                     self.screen = Screen::Drive;
                     self.refresh();
                 }
-                // e.g. "wrong password" or "no drive here".
                 Err(e) => self.msg = format!("{e}"),
             }
         }
@@ -246,8 +353,6 @@ mod imp {
             self.msg.clear();
             self.screen = Screen::Home;
         }
-
-        // ---- browser ------------------------------------------------------
 
         fn refresh(&mut self) {
             let cwd = self.cwd.clone();
@@ -369,8 +474,6 @@ mod imp {
             }
         }
 
-        // ---- mount --------------------------------------------------------
-
         fn is_mounted(&self) -> bool {
             self.child.is_some()
         }
@@ -409,11 +512,23 @@ mod imp {
 
     impl eframe::App for CloakGui {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-            egui::CentralPanel::default().show(ctx, |ui| match self.screen {
-                Screen::Home => self.home_ui(ui),
-                Screen::Create => self.create_ui(ui),
-                Screen::Open => self.open_ui(ui),
-                Screen::Drive => self.drive_ui(ui),
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // Centered, fixed-width content column for a modern app feel.
+                let full = ui.available_width();
+                let w = full.min(470.0);
+                let pad = ((full - w) * 0.5).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(pad);
+                    ui.vertical(|ui| {
+                        ui.set_width(w);
+                        match self.screen {
+                            Screen::Home => self.home_ui(ui),
+                            Screen::Create => self.create_ui(ui),
+                            Screen::Open => self.open_ui(ui),
+                            Screen::Drive => self.drive_ui(ui),
+                        }
+                    });
+                });
             });
         }
 
@@ -423,22 +538,74 @@ mod imp {
     }
 
     impl CloakGui {
+        fn header(&self, ui: &mut egui::Ui, subtitle: &str) {
+            ui.add_space(18.0);
+            ui.heading(RichText::new("cloak").color(ACCENT).strong());
+            ui.add_space(2.0);
+            ui.label(RichText::new(subtitle).color(MUTED));
+            ui.add_space(16.0);
+        }
+
         fn home_ui(&mut self, ui: &mut egui::Ui) {
-            ui.add_space(28.0);
-            ui.vertical_centered(|ui| {
-                ui.heading("cloak");
-                ui.label("Encrypted drives, unlocked by password.");
-                ui.add_space(20.0);
+            self.header(ui, "Encrypted drives, unlocked by a password.");
+
+            if !self.recents.is_empty() {
+                ui.label(RichText::new("Your drives").strong());
+                ui.add_space(4.0);
+                let recents = self.recents.clone();
+                let mut open_path: Option<String> = None;
+                let mut forget: Option<String> = None;
+                egui::Frame::none()
+                    .fill(PANEL)
+                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .rounding(10.0)
+                    .inner_margin(12.0)
+                    .show(ui, |ui| {
+                        for (i, d) in recents.iter().enumerate() {
+                            if i > 0 {
+                                ui.separator();
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("Unlock").clicked() {
+                                    open_path = Some(d.path.clone());
+                                }
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(&d.name).strong());
+                                    ui.label(RichText::new(&d.path).weak().small());
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("remove").clicked() {
+                                            forget = Some(d.path.clone());
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                    });
+                if let Some(path) = open_path {
+                    self.reset_inputs();
+                    self.location = path;
+                    self.screen = Screen::Open;
+                }
+                if let Some(path) = forget {
+                    self.recents.retain(|d| d.path != path);
+                    save_recents(&self.recents);
+                }
+                ui.add_space(14.0);
+            }
+
+            ui.horizontal(|ui| {
                 if ui
-                    .add_sized([220.0, 36.0], egui::Button::new("Create new drive"))
+                    .add_sized([190.0, 38.0], egui::Button::new("Create new drive").fill(ACCENT))
                     .clicked()
                 {
                     self.reset_inputs();
                     self.screen = Screen::Create;
                 }
-                ui.add_space(10.0);
                 if ui
-                    .add_sized([220.0, 36.0], egui::Button::new("Open existing drive"))
+                    .add_sized([150.0, 38.0], egui::Button::new("Open other…"))
                     .clicked()
                 {
                     self.reset_inputs();
@@ -449,7 +616,7 @@ mod imp {
 
         fn location_row(&mut self, ui: &mut egui::Ui, hint: &str) {
             ui.label("Location");
-            ui.add(egui::TextEdit::singleline(&mut self.location).hint_text(hint));
+            ui.add(egui::TextEdit::singleline(&mut self.location).hint_text(hint).desired_width(260.0));
             if ui.button("Choose…").clicked() {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.location = dir.display().to_string();
@@ -459,22 +626,21 @@ mod imp {
         }
 
         fn create_ui(&mut self, ui: &mut egui::Ui) {
-            ui.heading("Create new drive");
-            ui.add_space(8.0);
-            egui::Grid::new("create").num_columns(3).spacing([8.0, 8.0]).show(ui, |ui| {
+            self.header(ui, "Create a new encrypted drive.");
+            egui::Grid::new("create").num_columns(3).spacing([8.0, 10.0]).show(ui, |ui| {
                 self.location_row(ui, "empty folder to hold the new drive");
                 ui.label("Password");
-                ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                ui.add(egui::TextEdit::singleline(&mut self.password).password(true).desired_width(260.0));
                 ui.label("");
                 ui.end_row();
                 ui.label("Confirm");
-                ui.add(egui::TextEdit::singleline(&mut self.confirm).password(true));
+                ui.add(egui::TextEdit::singleline(&mut self.confirm).password(true).desired_width(260.0));
                 ui.label("");
                 ui.end_row();
             });
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if ui.button("Create").clicked() {
+                if ui.add(egui::Button::new("Create drive").fill(ACCENT)).clicked() {
                     self.create_drive();
                 }
                 if ui.button("Back").clicked() {
@@ -486,18 +652,25 @@ mod imp {
         }
 
         fn open_ui(&mut self, ui: &mut egui::Ui) {
-            ui.heading("Open existing drive");
-            ui.add_space(8.0);
-            egui::Grid::new("open").num_columns(3).spacing([8.0, 8.0]).show(ui, |ui| {
+            self.header(ui, "Unlock an existing drive.");
+            egui::Grid::new("open").num_columns(3).spacing([8.0, 10.0]).show(ui, |ui| {
                 self.location_row(ui, "folder of an existing drive");
                 ui.label("Password");
-                ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.password)
+                        .password(true)
+                        .desired_width(260.0),
+                );
+                // Enter in the password field unlocks.
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.open_drive();
+                }
                 ui.label("");
                 ui.end_row();
             });
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if ui.button("Open").clicked() {
+                if ui.add(egui::Button::new("Unlock").fill(ACCENT)).clicked() {
                     self.open_drive();
                 }
                 if ui.button("Back").clicked() {
@@ -510,24 +683,29 @@ mod imp {
 
         fn msg_line(&self, ui: &mut egui::Ui) {
             if !self.msg.is_empty() {
-                ui.add_space(6.0);
-                ui.colored_label(egui::Color32::from_rgb(200, 70, 70), &self.msg);
+                ui.add_space(8.0);
+                ui.colored_label(ERR_RED, &self.msg);
             }
         }
 
         fn drive_ui(&mut self, ui: &mut egui::Ui) {
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
-                ui.heading("Drive");
-                ui.monospace(&self.location);
+                ui.heading(RichText::new(basename(&self.location)).color(ACCENT).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close drive").clicked() {
+                        self.close_drive();
+                    }
+                });
             });
-            if ui.button("Close drive").clicked() {
-                self.close_drive();
-                return;
+            if self.screen != Screen::Drive {
+                return; // closed
             }
+            ui.label(RichText::new(&self.location).weak().small());
+            ui.add_space(8.0);
             ui.separator();
             self.browse_section(ui);
             ui.add_space(6.0);
-            ui.separator();
             egui::CollapsingHeader::new("Mount as a drive")
                 .default_open(false)
                 .show(ui, |ui| self.mount_section(ui));
@@ -535,21 +713,21 @@ mod imp {
 
         fn browse_section(&mut self, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.cwd.is_empty(), egui::Button::new("Up")).clicked() {
+                if ui.add_enabled(!self.cwd.is_empty(), egui::Button::new("⬆ Up")).clicked() {
                     self.navigate_up();
                 }
                 let crumb = if self.cwd.is_empty() { "/" } else { self.cwd.as_str() };
                 ui.monospace(crumb);
             });
             ui.horizontal(|ui| {
-                if ui.button("Import file…").clicked() {
+                if ui.add(egui::Button::new("Import file…").fill(ACCENT)).clicked() {
                     if let Some(src) = rfd::FileDialog::new().pick_file() {
                         self.import_file(src);
                     }
                 }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_folder)
-                        .desired_width(120.0)
+                        .desired_width(130.0)
                         .hint_text("new folder"),
                 );
                 if ui.button("Create folder").clicked() {
@@ -557,41 +735,49 @@ mod imp {
                 }
             });
 
-            ui.separator();
-
-            let entries = self.entries.clone();
-            let mut navigate: Option<String> = None;
-            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                if entries.is_empty() {
-                    ui.weak("(empty)");
-                }
-                for (name, is_dir, size) in &entries {
-                    ui.horizontal(|ui| {
-                        let selected = self.selected.as_deref() == Some(name.as_str());
-                        let label = if *is_dir {
-                            format!("📁 {name}")
-                        } else {
-                            format!("📄 {name}")
-                        };
-                        if ui.selectable_label(selected, label).clicked() {
-                            self.selected = Some(name.clone());
+            ui.add_space(4.0);
+            egui::Frame::none().fill(PANEL).stroke(egui::Stroke::new(1.0, BORDER)).rounding(10.0).inner_margin(10.0).show(ui, |ui| {
+                let entries = self.entries.clone();
+                let mut navigate: Option<String> = None;
+                egui::ScrollArea::vertical().max_height(210.0).auto_shrink([false, false]).show(
+                    ui,
+                    |ui| {
+                        if entries.is_empty() {
+                            ui.weak("(empty)");
                         }
-                        if *is_dir {
-                            if ui.small_button("open").clicked() {
-                                navigate = Some(name.clone());
-                            }
-                        } else {
-                            ui.weak(human_size(*size));
+                        for (name, is_dir, size) in &entries {
+                            ui.horizontal(|ui| {
+                                let selected = self.selected.as_deref() == Some(name.as_str());
+                                let label = if *is_dir {
+                                    RichText::new(format!("{name}/")).strong()
+                                } else {
+                                    RichText::new(name)
+                                };
+                                if ui.selectable_label(selected, label).clicked() {
+                                    self.selected = Some(name.clone());
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if *is_dir {
+                                            if ui.small_button("open").clicked() {
+                                                navigate = Some(name.clone());
+                                            }
+                                        } else {
+                                            ui.weak(human_size(*size));
+                                        }
+                                    },
+                                );
+                            });
                         }
-                    });
+                    },
+                );
+                if let Some(n) = navigate {
+                    self.navigate_into(&n);
                 }
             });
-            if let Some(n) = navigate {
-                self.navigate_into(&n);
-            }
 
-            ui.separator();
-
+            ui.add_space(6.0);
             let sel = self.selected.clone();
             let is_file = sel
                 .as_ref()
@@ -613,7 +799,7 @@ mod imp {
                 ui.add_enabled(
                     has_sel,
                     egui::TextEdit::singleline(&mut self.rename_to)
-                        .desired_width(120.0)
+                        .desired_width(130.0)
                         .hint_text("rename to"),
                 );
                 if ui.add_enabled(has_sel, egui::Button::new("Rename")).clicked() {
@@ -623,7 +809,12 @@ mod imp {
 
             if !self.msg.is_empty() {
                 ui.add_space(4.0);
-                ui.colored_label(egui::Color32::from_rgb(90, 90, 90), &self.msg);
+                let color = if self.msg.contains("failed") || self.msg.contains("Couldn't") {
+                    ERR_RED
+                } else {
+                    OK_GREEN
+                };
+                ui.colored_label(color, &self.msg);
             }
         }
 
@@ -657,7 +848,7 @@ mod imp {
                 }
             });
             ui.horizontal(|ui| {
-                if ui.add_enabled(!mounted, egui::Button::new("Mount")).clicked() {
+                if ui.add_enabled(!mounted, egui::Button::new("Mount").fill(ACCENT)).clicked() {
                     self.mount();
                 }
                 if ui.add_enabled(mounted, egui::Button::new("Unmount")).clicked() {
@@ -666,10 +857,17 @@ mod imp {
             });
             if !self.mount_status.is_empty() {
                 ui.add_space(4.0);
-                ui.weak(&self.mount_status);
+                let color = if self.mount_status.starts_with("Mounted") {
+                    OK_GREEN
+                } else if self.mount_status.starts_with("Couldn't") {
+                    ERR_RED
+                } else {
+                    Color32::GRAY
+                };
+                ui.colored_label(color, &self.mount_status);
             }
             ui.add_space(2.0);
-            ui.small("Mounting needs the FUSE/WinFsp driver installed. Browsing above needs nothing.");
+            ui.small("Mounting needs the FUSE/WinFsp driver. Browsing above needs nothing.");
         }
     }
 }
