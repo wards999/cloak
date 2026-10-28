@@ -6,6 +6,11 @@
 /mnt
 *.cloakstore
 
+# Python
+__pycache__/
+*.pyc
+.venv/
+
 # Editor / OS cruft
 *.swp
 .DS_Store

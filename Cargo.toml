@@ -39,6 +39,11 @@ path = "src/bin/winmount.rs"
 required-features = ["winfsp"]
 
 # Cross-platform GUI controller. Launches the right mount adapter per OS.
+# Headless engine CLI — the bridge the Python/Fluent GUI calls.
+[[bin]]
+name = "cloak"
+path = "src/bin/cli.rs"
+
 [[bin]]
 name = "cloak-gui"
 path = "src/bin/gui.rs"
