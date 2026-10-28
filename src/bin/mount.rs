@@ -91,11 +91,11 @@ mod imp {
         }
 
         fn file_attr(&self, ino: u64, name: &str) -> Option<FileAttr> {
-            let entry = self.store.index().by_original(name)?;
+            let meta = self.store.metadata(name).ok().flatten()?;
             Some(FileAttr {
                 ino,
-                size: entry.size,
-                blocks: (entry.size + 511) / 512,
+                size: meta.size,
+                blocks: (meta.size + 511) / 512,
                 atime: UNIX_EPOCH,
                 mtime: UNIX_EPOCH,
                 ctime: UNIX_EPOCH,

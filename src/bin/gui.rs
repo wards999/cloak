@@ -67,11 +67,23 @@ mod imp {
     }
 
     fn default_mount_point() -> String {
-        if cfg!(windows) {
-            "X:".to_string()
-        } else {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            format!("{home}/cloak-mnt")
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{home}/cloak-mnt")
+    }
+
+    /// Drive letters not currently in use, as `"X:"` strings. Windows only;
+    /// empty elsewhere. We start at D: to leave the usual system drives alone.
+    fn free_drive_letters() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            ('D'..='Z')
+                .filter(|c| !std::path::Path::new(&format!("{c}:\\")).exists())
+                .map(|c| format!("{c}:"))
+                .collect()
+        }
+        #[cfg(not(windows))]
+        {
+            Vec::new()
         }
     }
 
@@ -87,16 +99,31 @@ mod imp {
         passphrase: String,
         status: Status,
         child: Option<Child>,
+        /// Free drive letters offered in the Windows dropdown.
+        drive_letters: Vec<String>,
     }
 
     impl Default for CloakGui {
         fn default() -> Self {
+            let drive_letters = free_drive_letters();
+            let mount_point = if cfg!(windows) {
+                // Prefer X: if free, else the first free letter.
+                drive_letters
+                    .iter()
+                    .find(|d| d.as_str() == "X:")
+                    .or_else(|| drive_letters.first())
+                    .cloned()
+                    .unwrap_or_else(|| "X:".to_string())
+            } else {
+                default_mount_point()
+            };
             Self {
                 store: String::new(),
-                mount_point: default_mount_point(),
+                mount_point,
                 passphrase: String::new(),
                 status: Status::Idle,
                 child: None,
+                drive_letters,
             }
         }
     }
@@ -186,12 +213,33 @@ mod imp {
                         ui.end_row();
 
                         ui.label("Mount point");
-                        ui.add_enabled(
-                            !mounted,
-                            egui::TextEdit::singleline(&mut self.mount_point)
-                                .hint_text(if cfg!(windows) { "X:" } else { "/path/to/mnt" }),
-                        );
-                        ui.label("");
+                        if cfg!(windows) {
+                            // Dropdown of free drive letters.
+                            let letters = self.drive_letters.clone();
+                            ui.add_enabled_ui(!mounted, |ui| {
+                                egui::ComboBox::from_id_source("drive_letter")
+                                    .selected_text(if self.mount_point.is_empty() {
+                                        "(choose)".to_owned()
+                                    } else {
+                                        self.mount_point.clone()
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        for d in &letters {
+                                            ui.selectable_value(&mut self.mount_point, d.clone(), d);
+                                        }
+                                    });
+                            });
+                            if ui.add_enabled(!mounted, egui::Button::new("Refresh")).clicked() {
+                                self.drive_letters = free_drive_letters();
+                            }
+                        } else {
+                            ui.add_enabled(
+                                !mounted,
+                                egui::TextEdit::singleline(&mut self.mount_point)
+                                    .hint_text("/path/to/mnt"),
+                            );
+                            ui.label("");
+                        }
                         ui.end_row();
 
                         ui.label("Passphrase");

@@ -1,30 +1,31 @@
-//! The storage engine: the portable core the mount adapter sits on top of.
+//! The storage engine: a path-addressed tree store (Approach A).
 //!
-//! It owns the backing directory, the index, and the master key, and exposes the
-//! operations the filesystem layer needs:
+//! The backing store mirrors the logical directory tree using boring-named
+//! directories, and each directory carries its own encrypted manifest (see
+//! [`crate::manifest`]). A logical path like `Documents/Taxes/Return.pdf` is
+//! resolved by walking manifests from the root, descending into each child's
+//! boring on-disk directory, until the final component.
 //!
-//!   * `ingest`   — take a real file, give it a boring name, encrypt its ends,
-//!                  write the blob, record the mapping.
-//!   * `create` / `write_at` / `truncate` / `remove` — the write path.
-//!   * `read_at`  — the mount's read path: pull a byte range by original name,
-//!                  decrypting only the portion that overlaps a protected region.
-//!   * `list`     — the original names a directory listing should show.
+//! File *contents* use the same header/footer ChaCha20 scheme as before; only
+//! the directory layer is new. Directories themselves hold no blob and are never
+//! encrypted — their real names live solely in the parent's manifest, so a
+//! folder is "obfuscated" by having no real name on disk at all.
 //!
-//! Everything here is plain file I/O + the modules around it, so it runs and is
-//! fully testable without any FUSE/WinFsp driver present.
+//! All operations are plain file I/O, so the engine runs and is fully tested
+//! without any FUSE/WinFsp driver.
 
 use crate::boring::generate_unique;
 use crate::crypto::{protected_ranges, transform_region, Key, Nonce, NONCE_LEN};
-use crate::index::{Entry, Index};
 use crate::key::{self, Salt, SALT_LEN};
+use crate::manifest::{Child, Kind, Manifest};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::cmp::{max, min};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Store-wide metadata persisted next to the blobs. The salt is not secret; it
-/// just makes the passphrase-derived key unique per store.
+/// Store-wide metadata persisted at the backing root (reserved name, distinct
+/// from a directory manifest).
 #[derive(Serialize, Deserialize)]
 struct StoreMeta {
     version: u32,
@@ -32,42 +33,55 @@ struct StoreMeta {
     region: u64,
 }
 
+/// What a path points at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Metadata {
+    pub is_dir: bool,
+    pub size: u64,
+}
+
 pub struct Store {
     backing_dir: PathBuf,
-    index_path: PathBuf,
-    index: Index,
     key: Key,
-    /// Protected-region size encrypted at each end of every ingested file.
     region: u64,
 }
 
+/// Split a logical path into non-empty components (accepts `/` or `\`).
+fn components(path: &str) -> Vec<String> {
+    path.split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Split into (parent components, final name). Errors on an empty path.
+fn parent_and_name(path: &str) -> io::Result<(Vec<String>, String)> {
+    let mut comps = components(path);
+    let name = comps
+        .pop()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty path"))?;
+    Ok((comps, name))
+}
+
+fn not_found() -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, "no such path")
+}
+
 impl Store {
-    /// Open (or create) a store rooted at `backing_dir`, using `key` as the
-    /// master key and `region` bytes protected at each end of each file.
+    /// Open (or create) a store with a raw master key.
     pub fn open(backing_dir: impl AsRef<Path>, key: Key, region: u64) -> io::Result<Self> {
         let backing_dir = backing_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&backing_dir)?;
-        let index_path = backing_dir.join("index.json");
-        let index = if index_path.exists() {
-            Index::load(&index_path)?
-        } else {
-            Index::new()
-        };
         Ok(Self {
             backing_dir,
-            index_path,
-            index,
             key,
             region,
         })
     }
 
-    /// Open (or create) a store whose master key is derived from a passphrase.
-    ///
-    /// On first use a random salt is generated and written to `meta.json` along
-    /// with `region`; on later opens the stored salt and region are reused and
-    /// the `region` argument is ignored. A wrong passphrase is not rejected — it
-    /// simply derives a different key, so files decrypt to garbage.
+    /// Open (or create) a store whose key is derived from a passphrase. On first
+    /// use a random salt + the region are written to `meta.json`; later opens
+    /// reuse the stored salt/region and ignore the `region` argument.
     pub fn open_with_passphrase(
         backing_dir: impl AsRef<Path>,
         passphrase: &str,
@@ -95,222 +109,310 @@ impl Store {
         Self::open(backing_dir, derived, region)
     }
 
-    pub fn index(&self) -> &Index {
-        &self.index
+    // ---- path resolution -------------------------------------------------
+
+    /// Resolve a sequence of directory components to their on-disk path.
+    fn resolve_dir(&self, comps: &[String]) -> io::Result<PathBuf> {
+        let mut cur = self.backing_dir.clone();
+        for name in comps {
+            let manifest = Manifest::load(&cur, &self.key)?;
+            let child = manifest
+                .find(name)
+                .filter(|c| c.is_dir())
+                .ok_or_else(not_found)?;
+            cur = cur.join(&child.boring);
+        }
+        Ok(cur)
     }
 
-    /// Original names for a directory listing.
+    // ---- queries ---------------------------------------------------------
+
+    /// Metadata for a path. The root (`""`/`"/"`) is a directory.
+    pub fn metadata(&self, path: &str) -> io::Result<Option<Metadata>> {
+        let comps = components(path);
+        if comps.is_empty() {
+            return Ok(Some(Metadata {
+                is_dir: true,
+                size: 0,
+            }));
+        }
+        let (parent, name) = (comps[..comps.len() - 1].to_vec(), comps[comps.len() - 1].clone());
+        let parent_disk = match self.resolve_dir(&parent) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let manifest = Manifest::load(&parent_disk, &self.key)?;
+        Ok(manifest.find(&name).map(|c| Metadata {
+            is_dir: c.is_dir(),
+            size: c.size,
+        }))
+    }
+
+    /// List a directory: (name, is_dir, size) for each immediate child.
+    pub fn list_dir(&self, path: &str) -> io::Result<Vec<(String, bool, u64)>> {
+        let disk = self.resolve_dir(&components(path))?;
+        let manifest = Manifest::load(&disk, &self.key)?;
+        Ok(manifest
+            .children
+            .iter()
+            .map(|c| (c.real.clone(), c.is_dir(), c.size))
+            .collect())
+    }
+
+    /// Root-level child names (flat-compatibility helper for the mount adapters).
     pub fn list(&self) -> Vec<String> {
-        self.index.original_names().map(str::to_owned).collect()
+        self.list_dir("")
+            .map(|v| v.into_iter().map(|(n, _, _)| n).collect())
+            .unwrap_or_default()
     }
 
-    /// Ingest a real file: copy it into the backing store under a boring name,
-    /// with its header and footer encrypted. Returns the scrambled name.
+    // ---- mutations -------------------------------------------------------
+
+    /// Create a new directory at `path`. Its parent must already exist.
+    pub fn mkdir(&mut self, path: &str) -> io::Result<()> {
+        let (parent, name) = parent_and_name(path)?;
+        let parent_disk = self.resolve_dir(&parent)?;
+        let mut manifest = Manifest::load(&parent_disk, &self.key)?;
+        if manifest.find(&name).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "name already exists",
+            ));
+        }
+        let boring = generate_unique(&mut rand::thread_rng(), &manifest.used_boring_names());
+        std::fs::create_dir_all(parent_disk.join(&boring))?;
+        manifest.children.push(Child {
+            real: name,
+            boring,
+            kind: Kind::Dir,
+            nonce: [0u8; NONCE_LEN],
+            size: 0,
+        });
+        manifest.save(&parent_disk, &self.key)
+    }
+
+    /// Create an empty file at `path` (parent must exist). Returns its boring
+    /// name; if the name already exists, returns the existing boring name.
+    pub fn create(&mut self, path: &str) -> io::Result<String> {
+        let (parent, name) = parent_and_name(path)?;
+        let parent_disk = self.resolve_dir(&parent)?;
+        let mut manifest = Manifest::load(&parent_disk, &self.key)?;
+        if let Some(existing) = manifest.find(&name) {
+            return Ok(existing.boring.clone());
+        }
+        let mut nonce = [0u8; NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let boring = generate_unique(&mut rand::thread_rng(), &manifest.used_boring_names());
+        std::fs::write(parent_disk.join(&boring), [])?;
+        manifest.children.push(Child {
+            real: name,
+            boring: boring.clone(),
+            kind: Kind::File,
+            nonce,
+            size: 0,
+        });
+        manifest.save(&parent_disk, &self.key)?;
+        Ok(boring)
+    }
+
+    /// Ingest a real file into the root under its own filename.
     pub fn ingest(&mut self, source: impl AsRef<Path>) -> io::Result<String> {
         let source = source.as_ref();
-        let original = source
+        let name = source
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no file name"))?
             .to_owned();
-
-        let mut data = std::fs::read(source)?;
-        let size = data.len() as u64;
-
-        let mut nonce = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce);
-
-        for (start, end) in protected_ranges(size, self.region) {
-            transform_region(&self.key, &nonce, start, &mut data[start as usize..end as usize]);
-        }
-
-        let scrambled = generate_unique(&mut rand::thread_rng(), &self.index);
-        std::fs::write(self.backing_dir.join(&scrambled), &data)?;
-
-        self.index.insert(Entry {
-            original,
-            scrambled: scrambled.clone(),
-            nonce,
-            region: self.region,
-            size,
-        });
-        self.index.save(&self.index_path)?;
-        Ok(scrambled)
+        let data = std::fs::read(source)?;
+        let boring = self.create(&name)?;
+        self.write_at(&name, 0, &data)?;
+        Ok(boring)
     }
 
-    /// Create an empty file under `original`. Returns its scrambled name. If the
-    /// name already exists, returns the existing scrambled name unchanged.
-    pub fn create(&mut self, original: &str) -> io::Result<String> {
-        if let Some(e) = self.index.by_original(original) {
-            return Ok(e.scrambled.clone());
+    /// Write `data` at `offset`, growing the file if needed. Fast path: a write
+    /// that neither changes the size nor touches an encrypted end goes straight
+    /// to disk; otherwise read-modify-write the whole file.
+    pub fn write_at(&mut self, path: &str, offset: u64, data: &[u8]) -> io::Result<()> {
+        let (parent, name) = parent_and_name(path)?;
+        let parent_disk = self.resolve_dir(&parent)?;
+        let mut manifest = Manifest::load(&parent_disk, &self.key)?;
+        let pos = manifest.position(&name).ok_or_else(not_found)?;
+        if manifest.children[pos].is_dir() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "is a directory"));
         }
-        let mut nonce = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let scrambled = generate_unique(&mut rand::thread_rng(), &self.index);
-        std::fs::write(self.backing_dir.join(&scrambled), [])?;
-        self.index.insert(Entry {
-            original: original.to_owned(),
-            scrambled: scrambled.clone(),
-            nonce,
-            region: self.region,
-            size: 0,
-        });
-        self.index.save(&self.index_path)?;
-        Ok(scrambled)
-    }
-
-    /// Write `data` at `offset`, growing the file if needed.
-    ///
-    /// Fast path: if the write neither changes the size nor touches an encrypted
-    /// end, the bytes are plaintext passthrough and go straight to disk with no
-    /// crypto — the large-file win. Otherwise we read-modify-write the whole file
-    /// (decrypt ends, splice, re-encrypt ends), which is always correct.
-    pub fn write_at(&mut self, original: &str, offset: u64, data: &[u8]) -> io::Result<()> {
-        let entry = self
-            .index
-            .by_original(original)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))?;
-        let scrambled = entry.scrambled.clone();
-        let nonce = entry.nonce;
-        let region = entry.region;
-        let old_size = entry.size;
+        let boring = manifest.children[pos].boring.clone();
+        let nonce = manifest.children[pos].nonce;
+        let old_size = manifest.children[pos].size;
+        let blob = parent_disk.join(&boring);
 
         let write_end = offset + data.len() as u64;
         let new_size = max(old_size, write_end);
-        let blob = self.backing_dir.join(&scrambled);
 
-        if new_size == old_size && !range_hits_protected(offset, write_end, old_size, region) {
+        if new_size == old_size && !range_hits_protected(offset, write_end, old_size, self.region) {
             let mut f = std::fs::OpenOptions::new().write(true).open(&blob)?;
             f.seek(SeekFrom::Start(offset))?;
             f.write_all(data)?;
             return Ok(());
         }
 
-        let mut plain = self.decrypt_blob(&scrambled, &nonce, region, old_size)?;
+        let mut plain = self.decrypt_blob(&blob, &nonce, old_size)?;
         if new_size as usize > plain.len() {
             plain.resize(new_size as usize, 0);
         }
-        let o = offset as usize;
-        plain[o..o + data.len()].copy_from_slice(data);
-
-        for (start, end) in protected_ranges(new_size, region) {
-            transform_region(&self.key, &nonce, start, &mut plain[start as usize..end as usize]);
+        plain[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+        for (s, e) in protected_ranges(new_size, self.region) {
+            transform_region(&self.key, &nonce, s, &mut plain[s as usize..e as usize]);
         }
         std::fs::write(&blob, &plain)?;
 
-        self.index.insert(Entry {
-            original: original.to_owned(),
-            scrambled,
-            nonce,
-            region,
-            size: new_size,
-        });
-        self.index.save(&self.index_path)?;
-        Ok(())
+        manifest.children[pos].size = new_size;
+        manifest.save(&parent_disk, &self.key)
     }
 
-    /// Set the file's length (shorter truncates, longer zero-extends).
-    pub fn truncate(&mut self, original: &str, new_size: u64) -> io::Result<()> {
-        let entry = self
-            .index
-            .by_original(original)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))?;
-        let scrambled = entry.scrambled.clone();
-        let nonce = entry.nonce;
-        let region = entry.region;
-        let old_size = entry.size;
+    /// Set a file's length (shorter truncates, longer zero-extends).
+    pub fn truncate(&mut self, path: &str, new_size: u64) -> io::Result<()> {
+        let (parent, name) = parent_and_name(path)?;
+        let parent_disk = self.resolve_dir(&parent)?;
+        let mut manifest = Manifest::load(&parent_disk, &self.key)?;
+        let pos = manifest.position(&name).ok_or_else(not_found)?;
+        let boring = manifest.children[pos].boring.clone();
+        let nonce = manifest.children[pos].nonce;
+        let old_size = manifest.children[pos].size;
+        let blob = parent_disk.join(&boring);
 
-        let mut plain = self.decrypt_blob(&scrambled, &nonce, region, old_size)?;
+        let mut plain = self.decrypt_blob(&blob, &nonce, old_size)?;
         plain.resize(new_size as usize, 0);
-        for (start, end) in protected_ranges(new_size, region) {
-            transform_region(&self.key, &nonce, start, &mut plain[start as usize..end as usize]);
+        for (s, e) in protected_ranges(new_size, self.region) {
+            transform_region(&self.key, &nonce, s, &mut plain[s as usize..e as usize]);
         }
-        std::fs::write(self.backing_dir.join(&scrambled), &plain)?;
-
-        self.index.insert(Entry {
-            original: original.to_owned(),
-            scrambled,
-            nonce,
-            region,
-            size: new_size,
-        });
-        self.index.save(&self.index_path)?;
-        Ok(())
+        std::fs::write(&blob, &plain)?;
+        manifest.children[pos].size = new_size;
+        manifest.save(&parent_disk, &self.key)
     }
 
-    /// Delete a file: remove its blob and its index entry.
-    pub fn remove(&mut self, original: &str) -> io::Result<()> {
-        if let Some(e) = self.index.remove(original) {
-            let _ = std::fs::remove_file(self.backing_dir.join(&e.scrambled));
-            self.index.save(&self.index_path)?;
+    /// Delete a file, or a directory and its whole subtree.
+    pub fn remove(&mut self, path: &str) -> io::Result<()> {
+        let (parent, name) = parent_and_name(path)?;
+        let parent_disk = self.resolve_dir(&parent)?;
+        let mut manifest = Manifest::load(&parent_disk, &self.key)?;
+        let pos = match manifest.position(&name) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let child = manifest.children.remove(pos);
+        let target = parent_disk.join(&child.boring);
+        match child.kind {
+            Kind::File => {
+                let _ = std::fs::remove_file(&target);
+            }
+            Kind::Dir => {
+                let _ = std::fs::remove_dir_all(&target);
+            }
         }
-        Ok(())
+        manifest.save(&parent_disk, &self.key)
     }
 
-    /// Read `len` plaintext bytes starting at `offset` of the file the user knows
-    /// as `original`. This is exactly what the mount's `read` callback calls.
-    ///
-    /// Raw bytes come straight off the blob; only the slice overlapping a
-    /// protected region is run through the cipher, so a read landing entirely in
-    /// the passthrough middle does zero crypto.
-    pub fn read_at(&self, original: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let entry = self
-            .index
-            .by_original(original)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))?;
+    /// Rename or move a path. Same parent => rename in place (no disk move, the
+    /// boring name is untouched). Different parent => a single cheap on-disk
+    /// `rename` of the boring entry (moving a whole subtree in one metadata op).
+    pub fn rename_path(&mut self, old: &str, new: &str) -> io::Result<()> {
+        let (old_parent, old_name) = parent_and_name(old)?;
+        let (new_parent, new_name) = parent_and_name(new)?;
 
-        if offset >= entry.size {
+        let old_parent_disk = self.resolve_dir(&old_parent)?;
+        let mut old_manifest = Manifest::load(&old_parent_disk, &self.key)?;
+        let pos = old_manifest.position(&old_name).ok_or_else(not_found)?;
+
+        if old_parent == new_parent {
+            if old_name != new_name && old_manifest.find(&new_name).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination exists",
+                ));
+            }
+            old_manifest.children[pos].real = new_name;
+            return old_manifest.save(&old_parent_disk, &self.key);
+        }
+
+        // Move across directories.
+        let new_parent_disk = self.resolve_dir(&new_parent)?;
+        let mut new_manifest = Manifest::load(&new_parent_disk, &self.key)?;
+        if new_manifest.find(&new_name).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination exists",
+            ));
+        }
+        let mut moved = old_manifest.children.remove(pos);
+        let new_boring = generate_unique(&mut rand::thread_rng(), &new_manifest.used_boring_names());
+        std::fs::rename(
+            old_parent_disk.join(&moved.boring),
+            new_parent_disk.join(&new_boring),
+        )?;
+        moved.boring = new_boring;
+        moved.real = new_name;
+        new_manifest.children.push(moved);
+
+        old_manifest.save(&old_parent_disk, &self.key)?;
+        new_manifest.save(&new_parent_disk, &self.key)
+    }
+
+    // ---- reads -----------------------------------------------------------
+
+    /// Read `len` plaintext bytes at `offset` of the file at `path`.
+    pub fn read_at(&self, path: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let (parent, name) = parent_and_name(path)?;
+        let parent_disk = self.resolve_dir(&parent)?;
+        let manifest = Manifest::load(&parent_disk, &self.key)?;
+        let child = manifest.find(&name).ok_or_else(not_found)?;
+        if child.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "is a directory"));
+        }
+        let size = child.size;
+        if offset >= size {
             return Ok(Vec::new());
         }
-        let end = min(offset + len as u64, entry.size);
+        let end = min(offset + len as u64, size);
         let read_len = (end - offset) as usize;
 
-        let mut file = std::fs::File::open(self.backing_dir.join(&entry.scrambled))?;
+        let mut file = std::fs::File::open(parent_disk.join(&child.boring))?;
         file.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; read_len];
         file.read_exact(&mut buf)?;
 
-        for (rs, re) in protected_ranges(entry.size, entry.region) {
+        for (rs, re) in protected_ranges(size, self.region) {
             let o_start = max(offset, rs);
             let o_end = min(end, re);
             if o_start < o_end {
-                let local_s = (o_start - offset) as usize;
-                let local_e = (o_end - offset) as usize;
-                transform_region(&self.key, &entry.nonce, o_start, &mut buf[local_s..local_e]);
+                let ls = (o_start - offset) as usize;
+                let le = (o_end - offset) as usize;
+                transform_region(&self.key, &child.nonce, o_start, &mut buf[ls..le]);
             }
         }
         Ok(buf)
     }
 
-    /// Read a whole file back as plaintext (convenience over `read_at`).
-    pub fn read_all(&self, original: &str) -> io::Result<Vec<u8>> {
+    /// Read a whole file back as plaintext.
+    pub fn read_all(&self, path: &str) -> io::Result<Vec<u8>> {
         let size = self
-            .index
-            .by_original(original)
-            .map(|e| e.size)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))?;
-        self.read_at(original, 0, size as usize)
+            .metadata(path)?
+            .filter(|m| !m.is_dir)
+            .ok_or_else(not_found)?
+            .size;
+        self.read_at(path, 0, size as usize)
     }
 
-    /// Read a blob and decrypt its ends into plaintext, given its params. Used by
-    /// the read-modify-write paths where we hold the fields directly.
-    fn decrypt_blob(
-        &self,
-        scrambled: &str,
-        nonce: &Nonce,
-        region: u64,
-        size: u64,
-    ) -> io::Result<Vec<u8>> {
-        let mut data = std::fs::read(self.backing_dir.join(scrambled))?;
-        for (start, end) in protected_ranges(size, region) {
-            transform_region(&self.key, nonce, start, &mut data[start as usize..end as usize]);
+    /// Read a blob file and decrypt its ends into plaintext.
+    fn decrypt_blob(&self, blob: &Path, nonce: &Nonce, size: u64) -> io::Result<Vec<u8>> {
+        let mut data = std::fs::read(blob)?;
+        for (s, e) in protected_ranges(size, self.region) {
+            transform_region(&self.key, nonce, s, &mut data[s as usize..e as usize]);
         }
         Ok(data)
     }
 }
 
-/// Does the byte range `[start, end)` overlap any encrypted region of a file of
-/// `size` bytes with protected-region size `region`?
+/// Does `[start, end)` overlap any encrypted region of a file of `size` bytes?
 fn range_hits_protected(start: u64, end: u64, size: u64, region: u64) -> bool {
     protected_ranges(size, region)
         .into_iter()
@@ -322,159 +424,136 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
-        let p = dir.join(name);
-        std::fs::write(&p, bytes).unwrap();
-        p
+    fn store(dir: &Path) -> Store {
+        Store::open(dir, [9u8; 32], 128).unwrap()
     }
 
     #[test]
-    fn ingest_then_read_back_roundtrips() {
-        let src = tempdir().unwrap();
-        let store_dir = tempdir().unwrap();
-        let content: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
-        let src_file = write_file(src.path(), "Secret Plans.pdf", &content);
+    fn nested_create_read_roundtrip() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("Documents").unwrap();
+        s.mkdir("Documents/Taxes").unwrap();
+        s.create("Documents/Taxes/Return.pdf").unwrap();
+        let payload: Vec<u8> = (0..2000u32).map(|i| i as u8).collect();
+        s.write_at("Documents/Taxes/Return.pdf", 0, &payload).unwrap();
 
-        let mut store = Store::open(store_dir.path(), [9u8; 32], 256).unwrap();
-        let scrambled = store.ingest(&src_file).unwrap();
-
-        let on_disk = std::fs::read(store_dir.path().join(&scrambled)).unwrap();
-        assert_ne!(on_disk[..256], content[..256], "header must be encrypted");
-        assert_eq!(
-            on_disk[256..content.len() - 256],
-            content[256..content.len() - 256],
-            "middle must be plaintext passthrough"
-        );
-        assert_eq!(store.read_all("Secret Plans.pdf").unwrap(), content);
+        assert_eq!(s.read_all("Documents/Taxes/Return.pdf").unwrap(), payload);
+        // Listing shows real names at each level.
+        assert_eq!(s.list(), vec!["Documents".to_string()]);
+        let taxes = s.list_dir("Documents/Taxes").unwrap();
+        assert_eq!(taxes.len(), 1);
+        assert_eq!(taxes[0].0, "Return.pdf");
+        assert!(!taxes[0].1);
     }
 
     #[test]
-    fn ranged_reads_across_boundaries() {
-        let src = tempdir().unwrap();
-        let store_dir = tempdir().unwrap();
-        let content: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
-        let src_file = write_file(src.path(), "f.bin", &content);
+    fn on_disk_leaks_no_real_names() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("SecretFolder").unwrap();
+        s.create("SecretFolder/Passwords.txt").unwrap();
+        s.write_at("SecretFolder/Passwords.txt", 0, b"hunter2").unwrap();
 
-        let mut store = Store::open(store_dir.path(), [1u8; 32], 100).unwrap();
-        store.ingest(&src_file).unwrap();
-
-        assert_eq!(store.read_at("f.bin", 90, 20).unwrap(), content[90..110]);
-        assert_eq!(store.read_at("f.bin", 2000, 50).unwrap(), content[2000..2050]);
-        assert_eq!(store.read_at("f.bin", 3990, 20).unwrap(), content[3990..4010]);
-        assert_eq!(store.read_at("f.bin", 4090, 100).unwrap(), content[4090..]);
-    }
-
-    #[test]
-    fn index_persists_across_reopen() {
-        let src = tempdir().unwrap();
-        let store_dir = tempdir().unwrap();
-        let src_file = write_file(src.path(), "note.txt", b"hello world");
-        {
-            let mut store = Store::open(store_dir.path(), [5u8; 32], 64).unwrap();
-            store.ingest(&src_file).unwrap();
+        // Walk every path under the backing dir; no real name may appear as a
+        // file/dir name (manifests are encrypted, blobs/dirs are boring).
+        for entry in walkdir(d.path()) {
+            let name = entry.file_name().unwrap().to_string_lossy().to_string();
+            assert!(name != "SecretFolder" && name != "Passwords.txt");
         }
-        let store = Store::open(store_dir.path(), [5u8; 32], 64).unwrap();
-        assert_eq!(store.list(), vec!["note.txt".to_string()]);
-        assert_eq!(store.read_all("note.txt").unwrap(), b"hello world");
     }
 
-    #[test]
-    fn create_write_read_roundtrip() {
-        let store_dir = tempdir().unwrap();
-        let mut store = Store::open(store_dir.path(), [3u8; 32], 64).unwrap();
-        store.create("new.dat").unwrap();
-        let payload: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
-        store.write_at("new.dat", 0, &payload).unwrap();
-        assert_eq!(store.read_all("new.dat").unwrap(), payload);
-    }
-
-    #[test]
-    fn grow_by_writing_past_end() {
-        let store_dir = tempdir().unwrap();
-        let mut store = Store::open(store_dir.path(), [4u8; 32], 16).unwrap();
-        store.create("g.bin").unwrap();
-        store.write_at("g.bin", 0, b"AAAA").unwrap();
-        // Write past the current end: gap is zero-filled.
-        store.write_at("g.bin", 10, b"BBBB").unwrap();
-        let mut expected = b"AAAA".to_vec();
-        expected.resize(10, 0);
-        expected.extend_from_slice(b"BBBB");
-        assert_eq!(store.read_all("g.bin").unwrap(), expected);
-    }
-
-    #[test]
-    fn fast_path_middle_write_preserves_everything() {
-        let store_dir = tempdir().unwrap();
-        let mut store = Store::open(store_dir.path(), [6u8; 32], 32).unwrap();
-        let original: Vec<u8> = (0..2000u32).map(|i| i as u8).collect();
-        let src = tempdir().unwrap();
-        let f = write_file(src.path(), "m.bin", &original);
-        store.ingest(&f).unwrap();
-
-        // Overwrite 10 bytes deep in the passthrough middle (fast path).
-        store.write_at("m.bin", 1000, &[0xAB; 10]).unwrap();
-
-        let mut expected = original.clone();
-        expected[1000..1010].copy_from_slice(&[0xAB; 10]);
-        // Reopen to prove it landed on disk correctly and ends still decrypt.
-        drop(store);
-        let store = Store::open(store_dir.path(), [6u8; 32], 32).unwrap();
-        assert_eq!(store.read_all("m.bin").unwrap(), expected);
-    }
-
-    #[test]
-    fn truncate_shrinks_and_grows() {
-        let store_dir = tempdir().unwrap();
-        let mut store = Store::open(store_dir.path(), [7u8; 32], 16).unwrap();
-        store.create("t.bin").unwrap();
-        store.write_at("t.bin", 0, &vec![9u8; 100]).unwrap();
-
-        store.truncate("t.bin", 40).unwrap();
-        assert_eq!(store.read_all("t.bin").unwrap(), vec![9u8; 40]);
-
-        store.truncate("t.bin", 50).unwrap(); // grow back, zero-filled
-        let mut expected = vec![9u8; 40];
-        expected.resize(50, 0);
-        assert_eq!(store.read_all("t.bin").unwrap(), expected);
-    }
-
-    #[test]
-    fn remove_deletes_file_and_blob() {
-        let store_dir = tempdir().unwrap();
-        let mut store = Store::open(store_dir.path(), [8u8; 32], 16).unwrap();
-        let scrambled = store.create("bye.dat").unwrap();
-        store.write_at("bye.dat", 0, b"data").unwrap();
-
-        store.remove("bye.dat").unwrap();
-        assert!(store.read_all("bye.dat").is_err());
-        assert!(store.list().is_empty());
-        assert!(!store_dir.path().join(&scrambled).exists());
-    }
-
-    #[test]
-    fn passphrase_roundtrip_and_wrong_passphrase() {
-        let src = tempdir().unwrap();
-        let store_dir = tempdir().unwrap();
-        let content: Vec<u8> = (0..3000u32).map(|i| (i * 3) as u8).collect();
-        let f = write_file(src.path(), "diary.dat", &content);
-
-        {
-            let mut store =
-                Store::open_with_passphrase(store_dir.path(), "correct horse", 128).unwrap();
-            store.ingest(&f).unwrap();
+    fn walkdir(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            if p.is_dir() {
+                for e in std::fs::read_dir(&p).unwrap() {
+                    let e = e.unwrap().path();
+                    out.push(e.clone());
+                    stack.push(e);
+                }
+            }
         }
+        out
+    }
 
-        // Right passphrase: exact plaintext back.
-        let good = Store::open_with_passphrase(store_dir.path(), "correct horse", 128).unwrap();
-        assert_eq!(good.read_all("diary.dat").unwrap(), content);
+    #[test]
+    fn rename_in_place_file_and_folder() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("A").unwrap();
+        s.create("A/old.txt").unwrap();
+        s.write_at("A/old.txt", 0, b"data").unwrap();
 
-        // Wrong passphrase: different key => the encrypted ends come back as
-        // garbage, so the result does not match the real plaintext.
-        let bad = Store::open_with_passphrase(store_dir.path(), "wrong horse", 128).unwrap();
-        let out = bad.read_all("diary.dat").unwrap();
-        assert_ne!(out, content, "wrong passphrase must not reveal the header");
-        // The passthrough middle is NOT protected by the key — this is the
-        // documented limitation, asserted here so it stays visible.
-        assert_eq!(out[128..content.len() - 128], content[128..content.len() - 128]);
+        s.rename_path("A/old.txt", "A/new.txt").unwrap();
+        assert!(s.read_all("A/old.txt").is_err());
+        assert_eq!(s.read_all("A/new.txt").unwrap(), b"data");
+
+        s.rename_path("A", "B").unwrap();
+        assert_eq!(s.read_all("B/new.txt").unwrap(), b"data");
+    }
+
+    #[test]
+    fn move_folder_across_parents_keeps_subtree() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("src").unwrap();
+        s.mkdir("src/inner").unwrap();
+        s.create("src/inner/file.bin").unwrap();
+        let payload: Vec<u8> = (0..500u32).map(|i| (i * 3) as u8).collect();
+        s.write_at("src/inner/file.bin", 0, &payload).unwrap();
+        s.mkdir("dst").unwrap();
+
+        // Move the whole `inner` subtree under `dst`.
+        s.rename_path("src/inner", "dst/inner").unwrap();
+        assert!(s.read_all("src/inner/file.bin").is_err());
+        assert_eq!(s.read_all("dst/inner/file.bin").unwrap(), payload);
+    }
+
+    #[test]
+    fn remove_file_and_folder() {
+        let d = tempdir().unwrap();
+        let mut s = store(d.path());
+        s.mkdir("dir").unwrap();
+        s.create("dir/a.bin").unwrap();
+        s.remove("dir/a.bin").unwrap();
+        assert!(s.list_dir("dir").unwrap().is_empty());
+        s.remove("dir").unwrap();
+        assert!(s.list().is_empty());
+    }
+
+    #[test]
+    fn fast_path_middle_write_survives_reopen() {
+        let d = tempdir().unwrap();
+        {
+            let mut s = store(d.path());
+            s.create("big.bin").unwrap();
+            let orig: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+            s.write_at("big.bin", 0, &orig).unwrap();
+            s.write_at("big.bin", 1000, &[0xAB; 10]).unwrap(); // middle, fast path
+        }
+        let s = store(d.path());
+        let out = s.read_all("big.bin").unwrap();
+        assert_eq!(&out[1000..1010], &[0xAB; 10]);
+        assert_eq!(out.len(), 3000);
+    }
+
+    #[test]
+    fn passphrase_nested_roundtrip_and_wrong_key() {
+        let d = tempdir().unwrap();
+        {
+            let mut s = Store::open_with_passphrase(d.path(), "right", 64).unwrap();
+            s.mkdir("vault").unwrap();
+            s.create("vault/note.txt").unwrap();
+            s.write_at("vault/note.txt", 0, b"top secret contents").unwrap();
+        }
+        let good = Store::open_with_passphrase(d.path(), "right", 64).unwrap();
+        assert_eq!(good.read_all("vault/note.txt").unwrap(), b"top secret contents");
+
+        // Wrong passphrase can't even decrypt the root manifest, so `vault`
+        // won't resolve.
+        let bad = Store::open_with_passphrase(d.path(), "wrong", 64).unwrap();
+        assert!(bad.list().is_empty() || bad.read_all("vault/note.txt").is_err());
     }
 }

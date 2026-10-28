@@ -49,9 +49,9 @@ Two more honest caveats:
 ```
 src/crypto.rs   seekable ChaCha20; encrypt first-N and last-N bytes
 src/boring.rs   boring decoy-name generator
-src/index.rs    scrambled <-> original map + per-file nonce/size (JSON)
+src/manifest.rs per-directory encrypted boring<->real mapping (the tree)
 src/key.rs      Argon2id passphrase -> master key (key never stored)
-src/engine.rs   Store: ingest / create / write_at / truncate / read_at / remove
+src/engine.rs   Store: path/tree ops (mkdir / create / write_at / rename / move / remove)
 src/bin/mount.rs     read-write fuser mount adapter (macOS/Linux)
 src/bin/winmount.rs  read-write WinFsp mount adapter (Windows, MSVC)
 src/bin/gui.rs       cross-platform eframe GUI (mount/unmount + passphrase)
@@ -100,7 +100,8 @@ runner for you, and builds the core + GUI + fuser adapter across all three OSes.
 - [x] Read-write fuser mount adapter (macOS/Linux)
 - [x] WinFsp mount adapter (Windows, MSVC)
 - [x] Passphrase-derived key (Argon2id); key never stored
-- [x] Cross-platform GUI (mount/unmount + passphrase)
+- [x] Folder tree: boring-named dirs + per-directory encrypted manifests
+- [x] Cross-platform GUI (mount/unmount + passphrase; Windows drive-letter picker)
 - [x] Full-file vs ends-only benchmark
 - [x] GitHub Actions CI (core + adapters + GUI across 3 OSes)
 - [ ] FSKit adapter for modern macOS (kext-free; via a C-ABI core)

@@ -62,7 +62,13 @@ mod imp {
 
     impl CloakWinFs {
         fn size_of(&self, name: &str) -> Option<u64> {
-            self.store.lock().unwrap().index().by_original(name).map(|e| e.size)
+            self.store
+                .lock()
+                .unwrap()
+                .metadata(name)
+                .ok()
+                .flatten()
+                .map(|m| m.size)
         }
     }
 
@@ -247,12 +253,12 @@ mod imp {
             };
             let mut store = self.store.lock().unwrap();
             let at = if write_to_eof {
-                store.index().by_original(name).map(|e| e.size).unwrap_or(0)
+                store.metadata(name).ok().flatten().map(|m| m.size).unwrap_or(0)
             } else {
                 offset
             };
             store.write_at(name, at, buffer)?;
-            let size = store.index().by_original(name).map(|e| e.size).unwrap_or(0);
+            let size = store.metadata(name).ok().flatten().map(|m| m.size).unwrap_or(0);
             drop(store);
             fill_file_info(file_info, size, false);
             Ok(buffer.len() as u32)
