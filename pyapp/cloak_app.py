@@ -1,8 +1,9 @@
 """cloak — a Fluent-design drive manager (PySide6 + QFluentWidgets).
 
-The polished front end; all crypto/storage is the Rust `cloak` engine, reached
-through the `cloak` CLI (one JSON line per command, password via the
-CLOAK_PASSPHRASE env var). Mounting shells out to cloak-winmount / cloak-mount.
+Minimal by design: create drives, and lock / unlock them. Unlocking mounts the
+drive and opens it in your file manager; all file work happens there. The crypto
+and storage are the Rust `cloak` engine, reached through the `cloak` CLI (to
+verify the password) and the `cloak-winmount` / `cloak-mount` adapter (to mount).
 """
 
 import json
@@ -11,18 +12,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QHBoxLayout, QStackedWidget, QVBoxLayout,
-    QWidget, QHeaderView, QTableWidgetItem, QButtonGroup,
+    QApplication, QButtonGroup, QFileDialog, QHBoxLayout, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
     FluentWindow, FluentIcon as FIF, NavigationItemPosition, setTheme, setThemeColor,
     Theme, TitleLabel, SubtitleLabel, BodyLabel, StrongBodyLabel, CaptionLabel,
     PrimaryPushButton, PushButton, TransparentPushButton, LineEdit, PasswordLineEdit,
-    ComboBox, CardWidget, MessageBoxBase, FlowLayout, TableWidget, InfoBar,
-    InfoBarPosition, RadioButton,
+    ComboBox, CardWidget, MessageBoxBase, FlowLayout, InfoBar, InfoBarPosition,
+    RadioButton, SwitchButton,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -32,7 +32,7 @@ IS_WIN = sys.platform.startswith("win")
 
 # ---- engine bridge ---------------------------------------------------------
 
-def _find(exe_base: str) -> str:
+def _find(exe_base):
     env = os.environ.get("CLOAK_BIN") if exe_base == "cloak" else None
     if env and Path(env).exists():
         return env
@@ -41,18 +41,21 @@ def _find(exe_base: str) -> str:
         p = APP_DIR / rel / exe
         if p.exists():
             return str(p)
-    return exe  # fall back to PATH
+    return exe
 
 
 CLI = _find("cloak")
 
 
-def cli(args, password):
+def verify(path, password):
+    """Open the drive to check the password; raise RuntimeError on failure."""
     env = os.environ.copy()
     env["CLOAK_PASSPHRASE"] = password
-    proc = subprocess.run([CLI, *args], capture_output=True, text=True, env=env)
+    try:
+        proc = subprocess.run([CLI, "open", path], capture_output=True, text=True, env=env)
+    except OSError as e:
+        raise RuntimeError(f"engine not found ({e})")
     out = (proc.stdout or "").strip()
-    data = None
     try:
         data = json.loads(out) if out else {}
     except json.JSONDecodeError:
@@ -60,8 +63,31 @@ def cli(args, password):
     if isinstance(data, dict) and "error" in data:
         raise RuntimeError(data["error"])
     if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or "command failed").strip())
-    return data
+        raise RuntimeError((proc.stderr or "could not open drive").strip())
+
+
+def create_store(path, password):
+    env = os.environ.copy()
+    env["CLOAK_PASSPHRASE"] = password
+    try:
+        proc = subprocess.run([CLI, "create", path], capture_output=True, text=True, env=env)
+    except OSError as e:
+        raise RuntimeError(f"engine not found ({e})")
+    out = (proc.stdout or "").strip()
+    try:
+        data = json.loads(out) if out else {}
+    except json.JSONDecodeError:
+        data = {}
+    if isinstance(data, dict) and "error" in data:
+        raise RuntimeError(data["error"])
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or "could not create drive").strip())
+
+
+def free_drive_letters():
+    if not IS_WIN:
+        return []
+    return [f"{c}:" for c in "DEFGHIJKLMNOPQRSTUVWXYZ" if not Path(f"{c}\\").exists()]
 
 
 def load_drives():
@@ -79,16 +105,70 @@ def save_drives(drives):
         pass
 
 
-def human(n):
-    v = float(n)
-    for u in ("B", "KB", "MB", "GB", "TB"):
-        if v < 1024 or u == "TB":
-            return f"{int(n)} B" if u == "B" else f"{v:.1f} {u}"
-        v /= 1024
+def open_in_file_manager(mountpoint):
+    try:
+        if IS_WIN:
+            os.startfile(mountpoint if mountpoint.endswith("\\") else mountpoint + "\\")
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", mountpoint])
+        else:
+            subprocess.Popen(["xdg-open", mountpoint])
+    except Exception:
+        pass
 
 
-def join(d, name):
-    return name if not d else f"{d}/{name}"
+# ---- sleep / shutdown safety ----------------------------------------------
+#
+# Mounted drives are decrypted and live, so we unmount them when the machine
+# sleeps (security) and when it shuts down or logs off (clean teardown). Kept in
+# a module global so the filter/observer isn't garbage-collected.
+
+_POWER_HOOK = None
+
+
+def install_power_hook(app, on_power):
+    """Call on_power("sleep") on suspend and on_power("shutdown") on logoff/
+    shutdown. Best-effort and silent if the platform hook is unavailable."""
+    global _POWER_HOOK
+    if IS_WIN:
+        import ctypes
+        import ctypes.wintypes
+        from PySide6.QtCore import QAbstractNativeEventFilter
+
+        WM_POWERBROADCAST, PBT_APMSUSPEND = 0x0218, 0x0004
+        WM_QUERYENDSESSION, WM_ENDSESSION = 0x0011, 0x0016
+
+        class _Filter(QAbstractNativeEventFilter):
+            def nativeEventFilter(self, _etype, message):
+                try:
+                    msg = ctypes.wintypes.MSG.from_address(int(message))
+                    if msg.message == WM_POWERBROADCAST and msg.wParam == PBT_APMSUSPEND:
+                        on_power("sleep")
+                    elif msg.message in (WM_QUERYENDSESSION, WM_ENDSESSION):
+                        on_power("shutdown")
+                except Exception:
+                    pass
+                return (False, 0)
+
+        _POWER_HOOK = _Filter()
+        app.installNativeEventFilter(_POWER_HOOK)
+    elif sys.platform == "darwin":
+        try:
+            from Foundation import NSObject
+            from AppKit import NSWorkspace
+
+            class _Sleep(NSObject):
+                def onSleep_(self, _note):
+                    on_power("sleep")
+
+            obs = _Sleep.new()
+            nc = NSWorkspace.sharedWorkspace().notificationCenter()
+            nc.addObserver_selector_name_object_(
+                obs, "onSleep:", "NSWorkspaceWillSleepNotification", None
+            )
+            _POWER_HOOK = obs
+        except Exception:
+            pass
 
 
 # ---- dialogs ---------------------------------------------------------------
@@ -103,14 +183,14 @@ class CreateDialog(MessageBoxBase):
         self.pw = PasswordLineEdit(self); self.pw.setPlaceholderText("Password")
         self.pw2 = PasswordLineEdit(self); self.pw2.setPlaceholderText("Confirm password")
         row = QHBoxLayout(); row.addWidget(self.loc); row.addWidget(self.pick)
-        for w in (self.titleLabel, self.name):
-            self.viewLayout.addWidget(w)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.name)
         self.viewLayout.addLayout(row)
         self.viewLayout.addWidget(self.pw)
         self.viewLayout.addWidget(self.pw2)
         self.yesButton.setText("Create drive")
         self.cancelButton.setText("Cancel")
-        self.widget.setMinimumWidth(420)
+        self.widget.setMinimumWidth(430)
         self.pick.clicked.connect(self._choose)
 
     def _choose(self):
@@ -120,7 +200,7 @@ class CreateDialog(MessageBoxBase):
 
 
 class UnlockDialog(MessageBoxBase):
-    def __init__(self, parent, name, path):
+    def __init__(self, parent, name, path, letters):
         super().__init__(parent)
         self.titleLabel = SubtitleLabel(f"Unlock “{name}”", self)
         self.sub = CaptionLabel(path, self)
@@ -128,48 +208,57 @@ class UnlockDialog(MessageBoxBase):
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(self.sub)
         self.viewLayout.addWidget(self.pw)
+        self.combo = None
+        if letters:
+            row = QHBoxLayout()
+            row.addWidget(BodyLabel("Mount at", self))
+            self.combo = ComboBox(self)
+            self.combo.addItems(letters)
+            row.addWidget(self.combo); row.addStretch(1)
+            self.viewLayout.addLayout(row)
         self.yesButton.setText("Unlock")
         self.cancelButton.setText("Cancel")
-        self.widget.setMinimumWidth(380)
+        self.widget.setMinimumWidth(390)
         self.pw.returnPressed.connect(self.yesButton.click)
-
-
-class NameDialog(MessageBoxBase):
-    def __init__(self, parent, title, placeholder):
-        super().__init__(parent)
-        self.titleLabel = SubtitleLabel(title, self)
-        self.edit = LineEdit(self); self.edit.setPlaceholderText(placeholder)
-        self.viewLayout.addWidget(self.titleLabel)
-        self.viewLayout.addWidget(self.edit)
-        self.yesButton.setText("OK")
-        self.cancelButton.setText("Cancel")
-        self.widget.setMinimumWidth(360)
-        self.edit.returnPressed.connect(self.yesButton.click)
 
 
 # ---- drive card ------------------------------------------------------------
 
 class DriveCard(CardWidget):
-    def __init__(self, drive, on_unlock, on_remove):
+    def __init__(self, drive, mount, callbacks):
         super().__init__()
-        self.setFixedSize(250, 150)
-        lay = QVBoxLayout(self); lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(6)
-        name = StrongBodyLabel(drive["name"], self)
-        path = CaptionLabel(drive["path"], self); path.setWordWrap(True)
-        path.setStyleSheet("color: gray;")
-        lay.addWidget(name)
+        self.setFixedSize(260, 158)
+        lay = QVBoxLayout(self); lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(5)
+
+        lay.addWidget(StrongBodyLabel(drive["name"], self))
+        path = CaptionLabel(drive["path"], self); path.setWordWrap(True); path.setStyleSheet("color: gray;")
         lay.addWidget(path)
         lay.addStretch(1)
+
+        unlocked = mount is not None
+        status = CaptionLabel(
+            f"● Unlocked · {mount['mp']}" if unlocked else "○ Locked", self
+        )
+        status.setStyleSheet("color: #13b3a4;" if unlocked else "color: gray;")
+        lay.addWidget(status)
+
         row = QHBoxLayout()
-        unlock = PrimaryPushButton("Unlock", self)
-        unlock.clicked.connect(lambda: on_unlock(drive))
-        remove = TransparentPushButton("Remove", self)
-        remove.clicked.connect(lambda: on_remove(drive))
-        row.addWidget(unlock); row.addStretch(1); row.addWidget(remove)
+        if unlocked:
+            openb = PushButton("Open", self)
+            openb.clicked.connect(lambda: callbacks["open"](drive))
+            lockb = PrimaryPushButton("Lock", self)
+            lockb.clicked.connect(lambda: callbacks["lock"](drive))
+            row.addWidget(openb); row.addStretch(1); row.addWidget(lockb)
+        else:
+            unlockb = PrimaryPushButton("Unlock", self)
+            unlockb.clicked.connect(lambda: callbacks["unlock"](drive))
+            removeb = TransparentPushButton("Remove", self)
+            removeb.clicked.connect(lambda: callbacks["remove"](drive))
+            row.addWidget(unlockb); row.addStretch(1); row.addWidget(removeb)
         lay.addLayout(row)
 
 
-# ---- the Drives interface (list + browser) ---------------------------------
+# ---- drives interface ------------------------------------------------------
 
 class DrivesInterface(QWidget):
     def __init__(self, win):
@@ -177,292 +266,134 @@ class DrivesInterface(QWidget):
         self.win = win
         self.setObjectName("drivesInterface")
         self.drives = load_drives()
-        self.cur = None       # open drive dict
-        self.password = ""
-        self.cwd = ""
-        self.mount_proc = None
+        self.mounts = {}  # path -> {"proc": Popen, "mp": mountpoint}
 
-        self.stack = QStackedWidget(self)
-        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(self.stack)
-
-        self.stack.addWidget(self._build_list())
-        self.stack.addWidget(self._build_browser())
-        self.refresh_list()
-
-    # ----- list page -----
-    def _build_list(self):
-        page = QWidget(); page.setObjectName("listPage")
-        lay = QVBoxLayout(page); lay.setContentsMargins(36, 28, 36, 28); lay.setSpacing(16)
+        lay = QVBoxLayout(self); lay.setContentsMargins(36, 28, 36, 28); lay.setSpacing(16)
         head = QHBoxLayout()
-        title = TitleLabel("Your drives", page)
-        newbtn = PrimaryPushButton(FIF.ADD, "New drive", page)
+        head.addWidget(TitleLabel("Your drives", self)); head.addStretch(1)
+        newbtn = PrimaryPushButton(FIF.ADD, "New drive", self)
         newbtn.clicked.connect(self.create_drive)
-        head.addWidget(title); head.addStretch(1); head.addWidget(newbtn)
+        head.addWidget(newbtn)
         lay.addLayout(head)
-        lay.addWidget(CaptionLabel("Unlock a drive with its password, or create a new one.", page))
+        lay.addWidget(CaptionLabel("Unlock a drive to mount it — then work with your files in Explorer.", self))
 
-        self.cards_host = QWidget(page)
-        self.cards = FlowLayout(self.cards_host, needAni=True)
+        self.host = QWidget(self)
+        self.cards = FlowLayout(self.host, needAni=True)
         self.cards.setHorizontalSpacing(16); self.cards.setVerticalSpacing(16)
-        lay.addWidget(self.cards_host)
+        lay.addWidget(self.host)
         lay.addStretch(1)
-        return page
+        self.refresh()
 
-    def refresh_list(self):
+    def refresh(self):
         while self.cards.count():
             item = self.cards.takeAt(0)
             if item:
                 item.widget().deleteLater()
+        cbs = {"unlock": self.unlock, "lock": self.lock, "open": self.open_drive, "remove": self.remove}
         for d in self.drives:
-            self.cards.addWidget(DriveCard(d, self.unlock_drive, self.remove_drive))
+            self.cards.addWidget(DriveCard(d, self.mounts.get(d["path"]), cbs))
 
-    # ----- browser page -----
-    def _build_browser(self):
-        page = QWidget(); page.setObjectName("browserPage")
-        lay = QVBoxLayout(page); lay.setContentsMargins(36, 24, 36, 24); lay.setSpacing(14)
+    def err(self, msg):
+        InfoBar.error("Error", msg, duration=4500, position=InfoBarPosition.TOP, parent=self.win)
 
-        bar = QHBoxLayout()
-        self.dvName = SubtitleLabel("", page)
-        lock = PushButton(FIF.RETURN, "Lock drive", page) if hasattr(FIF, "RETURN") else PushButton("Lock drive", page)
-        lock.clicked.connect(self.lock_drive)
-        bar.addWidget(self.dvName); bar.addStretch(1); bar.addWidget(lock)
-        lay.addLayout(bar)
-        self.dvPath = CaptionLabel("", page); self.dvPath.setStyleSheet("color: gray;")
-        lay.addWidget(self.dvPath)
-
-        tools = QHBoxLayout()
-        up = PushButton("Up", page); up.clicked.connect(self.nav_up)
-        imp = PrimaryPushButton(FIF.ADD, "Import file", page); imp.clicked.connect(self.import_file)
-        mkd = PushButton(FIF.FOLDER, "New folder", page); mkd.clicked.connect(self.make_folder)
-        self.crumb = CaptionLabel("/", page)
-        tools.addWidget(up); tools.addWidget(imp); tools.addWidget(mkd)
-        tools.addStretch(1); tools.addWidget(self.crumb)
-        lay.addLayout(tools)
-
-        self.table = TableWidget(page)
-        self.table.setColumnCount(2)
-        self.table.setHorizontalHeaderLabels(["Name", "Size"])
-        self.table.verticalHeader().hide()
-        self.table.setSelectionBehavior(self.table.SelectionBehavior.SelectRows)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.cellDoubleClicked.connect(self._row_activated)
-        lay.addWidget(self.table, 1)
-
-        acts = QHBoxLayout()
-        ext = PushButton("Extract…", page); ext.clicked.connect(self.extract_sel)
-        rn = PushButton("Rename…", page); rn.clicked.connect(self.rename_sel)
-        dl = PushButton("Delete", page); dl.clicked.connect(self.delete_sel)
-        acts.addWidget(ext); acts.addWidget(rn); acts.addWidget(dl); acts.addStretch(1)
-        lay.addLayout(acts)
-
-        mount = CardWidget(page)
-        ml = QHBoxLayout(mount); ml.setContentsMargins(16, 12, 16, 12)
-        ml.addWidget(BodyLabel("Mount as a drive", mount))
-        self.mountSel = ComboBox(mount)
-        self.mountSel.addItems(["X:", "Y:", "Z:", "W:"] if IS_WIN else ["~/cloak-mnt"])
-        self.mountBtn = PrimaryPushButton("Mount", mount); self.mountBtn.clicked.connect(self.toggle_mount)
-        self.mountMsg = CaptionLabel("", mount)
-        ml.addWidget(self.mountSel); ml.addWidget(self.mountBtn); ml.addWidget(self.mountMsg); ml.addStretch(1)
-        lay.addWidget(mount)
-        return page
-
-    # ----- actions -----
-    def toast_err(self, msg):
-        InfoBar.error("Error", msg, duration=4000, position=InfoBarPosition.TOP, parent=self)
-
-    def toast_ok(self, msg):
-        InfoBar.success("Done", msg, duration=2000, position=InfoBarPosition.TOP, parent=self)
+    def ok(self, msg):
+        InfoBar.success("Done", msg, duration=2500, position=InfoBarPosition.TOP, parent=self.win)
 
     def create_drive(self):
         dlg = CreateDialog(self.win)
         if not dlg.exec():
             return
-        name, loc = dlg.name.text().strip(), dlg.loc.text().strip()
-        pw, pw2 = dlg.pw.text(), dlg.pw2.text()
+        name, loc, pw, pw2 = dlg.name.text().strip(), dlg.loc.text().strip(), dlg.pw.text(), dlg.pw2.text()
         if not name or not loc or not pw:
-            return self.toast_err("Name, location and password are required.")
+            return self.err("Name, location and password are required.")
         if pw != pw2:
-            return self.toast_err("Passwords don't match.")
+            return self.err("Passwords don't match.")
         try:
-            cli(["create", loc], pw)
+            create_store(loc, pw)
         except RuntimeError as e:
-            return self.toast_err(str(e))
+            return self.err(str(e))
         self.drives = [d for d in self.drives if d["path"] != loc]
         self.drives.insert(0, {"name": name, "path": loc})
         save_drives(self.drives)
-        self.refresh_list()
-        self._open(self.drives[0], pw)
+        self.refresh()
+        self.ok(f"Created “{name}”. Unlock it to mount.")
 
-    def unlock_drive(self, drive):
-        dlg = UnlockDialog(self.win, drive["name"], drive["path"])
+    def unlock(self, drive):
+        letters = free_drive_letters()
+        dlg = UnlockDialog(self.win, drive["name"], drive["path"], letters)
         if not dlg.exec():
             return
         pw = dlg.pw.text()
         try:
-            cli(["open", drive["path"]], pw)
+            verify(drive["path"], pw)
         except RuntimeError as e:
-            return self.toast_err(str(e))
-        self._open(drive, pw)
+            return self.err(str(e))
 
-    def remove_drive(self, drive):
+        if IS_WIN:
+            mp = dlg.combo.currentText() if dlg.combo else "X:"
+        else:
+            mp = str(Path.home() / "cloak-mnt" / drive["name"])
+            Path(mp).mkdir(parents=True, exist_ok=True)
+
+        adapter = _find("cloak-winmount" if IS_WIN else "cloak-mount")
+        env = os.environ.copy(); env["CLOAK_PASSPHRASE"] = pw
+        try:
+            proc = subprocess.Popen([adapter, drive["path"], mp], stdin=subprocess.PIPE, env=env)
+        except OSError as e:
+            return self.err(f"Couldn't start the mount driver ({e}). Is it installed?")
+        self.mounts[drive["path"]] = {"proc": proc, "mp": mp}
+        self.refresh()
+        self.ok(f"Unlocked at {mp}")
+        QTimer.singleShot(1200, lambda: open_in_file_manager(mp))
+
+    def lock(self, drive):
+        self._unmount(drive["path"])
+        self.refresh()
+
+    def _unmount(self, path):
+        m = self.mounts.pop(path, None)
+        if not m:
+            return
+        proc = m["proc"]
+        # Closing stdin tells the adapter to unmount cleanly; give it a moment,
+        # then force-terminate as a fallback (the driver also unmounts on exit).
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def open_drive(self, drive):
+        m = self.mounts.get(drive["path"])
+        if m:
+            open_in_file_manager(m["mp"])
+
+    def remove(self, drive):
         self.drives = [d for d in self.drives if d["path"] != drive["path"]]
         save_drives(self.drives)
-        self.refresh_list()
+        self.refresh()
 
-    def _open(self, drive, pw):
-        self.cur, self.password, self.cwd = drive, pw, ""
-        self.dvName.setText(drive["name"])
-        self.dvPath.setText(drive["path"])
-        self.mountMsg.setText("")
-        self.stack.setCurrentIndex(1)
-        self.refresh_browser()
-
-    def lock_drive(self):
-        self._stop_mount()
-        self.cur, self.password, self.cwd = None, "", ""
-        self.stack.setCurrentIndex(0)
-
-    def refresh_browser(self):
-        self.crumb.setText("/" + self.cwd)
-        try:
-            rows = cli(["ls", self.cur["path"], self.cwd], self.password)
-        except RuntimeError as e:
-            return self.toast_err(str(e))
-        rows.sort(key=lambda r: (not r["is_dir"], r["name"].lower()))
-        self.table.setRowCount(len(rows))
-        self._rows = rows
-        for i, r in enumerate(rows):
-            nm = QTableWidgetItem(("🗀  " if r["is_dir"] else "🗋  ") + r["name"])
-            nm.setData(Qt.ItemDataRole.UserRole, r)
-            self.table.setItem(i, 0, nm)
-            self.table.setItem(i, 1, QTableWidgetItem("" if r["is_dir"] else human(r["size"])))
-
-    def _row_activated(self, row, _col):
-        r = self._rows[row]
-        if r["is_dir"]:
-            self.cwd = join(self.cwd, r["name"])
-            self.refresh_browser()
-
-    def _selected(self):
-        row = self.table.currentRow()
-        if row < 0 or row >= len(self._rows):
-            return None
-        return self._rows[row]
-
-    def nav_up(self):
-        if self.cwd:
-            self.cwd = self.cwd.rsplit("/", 1)[0] if "/" in self.cwd else ""
-            self.refresh_browser()
-
-    def import_file(self):
-        src, _ = QFileDialog.getOpenFileName(self, "Import a file")
-        if not src:
-            return
-        name = Path(src).name
-        try:
-            cli(["write", self.cur["path"], join(self.cwd, name), src], self.password)
-            self.toast_ok(f"Imported {name}")
-        except RuntimeError as e:
-            return self.toast_err(str(e))
-        self.refresh_browser()
-
-    def make_folder(self):
-        dlg = NameDialog(self.win, "New folder", "Folder name")
-        if not dlg.exec():
-            return
-        name = dlg.edit.text().strip()
-        if not name:
-            return
-        try:
-            cli(["mkdir", self.cur["path"], join(self.cwd, name)], self.password)
-        except RuntimeError as e:
-            return self.toast_err(str(e))
-        self.refresh_browser()
-
-    def extract_sel(self):
-        r = self._selected()
-        if not r or r["is_dir"]:
-            return
-        dest, _ = QFileDialog.getSaveFileName(self, "Extract to", r["name"])
-        if not dest:
-            return
-        try:
-            cli(["read", self.cur["path"], join(self.cwd, r["name"]), dest], self.password)
-            self.toast_ok("Extracted.")
-        except RuntimeError as e:
-            self.toast_err(str(e))
-
-    def rename_sel(self):
-        r = self._selected()
-        if not r:
-            return
-        dlg = NameDialog(self.win, "Rename", "New name")
-        dlg.edit.setText(r["name"])
-        if not dlg.exec():
-            return
-        new = dlg.edit.text().strip()
-        if not new:
-            return
-        try:
-            cli(["mv", self.cur["path"], join(self.cwd, r["name"]), join(self.cwd, new)], self.password)
-        except RuntimeError as e:
-            return self.toast_err(str(e))
-        self.refresh_browser()
-
-    def delete_sel(self):
-        r = self._selected()
-        if not r:
-            return
-        try:
-            cli(["rm", self.cur["path"], join(self.cwd, r["name"])], self.password)
-        except RuntimeError as e:
-            return self.toast_err(str(e))
-        self.refresh_browser()
-
-    # ----- mount -----
-    def toggle_mount(self):
-        if self.mount_proc:
-            self._stop_mount()
-            return
-        exe = _find("cloak-winmount" if IS_WIN else "cloak-mount")
-        env = os.environ.copy(); env["CLOAK_PASSPHRASE"] = self.password
-        try:
-            self.mount_proc = subprocess.Popen(
-                [exe, self.cur["path"], self.mountSel.currentText()],
-                stdin=subprocess.PIPE, env=env,
-            )
-            self.mountBtn.setText("Unmount")
-            self.mountSel.setDisabled(True)
-            self.mountMsg.setText(f"Mounted at {self.mountSel.currentText()}")
-        except OSError as e:
-            self.toast_err(f"Couldn't launch mount adapter: {e}")
-
-    def _stop_mount(self):
-        if self.mount_proc:
-            try:
-                self.mount_proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                self.mount_proc.terminate()
-            except Exception:
-                pass
-            self.mount_proc = None
-            self.mountBtn.setText("Mount")
-            self.mountSel.setDisabled(False)
-            self.mountMsg.setText("")
+    def lock_all(self):
+        for path in list(self.mounts.keys()):
+            self._unmount(path)
 
 
-# ---- settings (theme) ------------------------------------------------------
+# ---- settings --------------------------------------------------------------
 
 class SettingsInterface(QWidget):
-    def __init__(self):
+    def __init__(self, win):
         super().__init__()
+        self.win = win
         self.setObjectName("settingsInterface")
         lay = QVBoxLayout(self); lay.setContentsMargins(36, 28, 36, 28); lay.setSpacing(12)
         lay.addWidget(TitleLabel("Settings", self))
+
         lay.addWidget(StrongBodyLabel("Appearance", self))
         lay.addWidget(CaptionLabel("Choose a theme.", self))
         group = QButtonGroup(self)
@@ -473,6 +404,19 @@ class SettingsInterface(QWidget):
                 rb.setChecked(True)
             group.addButton(rb)
             lay.addWidget(rb)
+
+        lay.addSpacing(10)
+        lay.addWidget(StrongBodyLabel("Security", self))
+        row = QHBoxLayout()
+        row.addWidget(BodyLabel("Auto-lock drives when the computer sleeps", self))
+        row.addStretch(1)
+        sw = SwitchButton(self)
+        sw.setChecked(win.auto_lock)
+        sw.checkedChanged.connect(lambda v: setattr(win, "auto_lock", v))
+        row.addWidget(sw)
+        lay.addLayout(row)
+        lay.addWidget(CaptionLabel("Drives always unmount on shutdown and when you quit.", self))
+
         lay.addStretch(1)
 
 
@@ -482,14 +426,21 @@ class Cloak(FluentWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("cloak")
-        self.resize(900, 620)
+        self.resize(820, 560)
+        self.auto_lock = True
         self.drives = DrivesInterface(self)
-        self.settings = SettingsInterface()
+        self.settings = SettingsInterface(self)
         self.addSubInterface(self.drives, FIF.FOLDER, "Drives")
         self.addSubInterface(self.settings, FIF.SETTING, "Settings", NavigationItemPosition.BOTTOM)
 
+    def on_power(self, kind):
+        # Shutdown/logoff always locks (clean teardown); sleep respects the setting.
+        if kind == "shutdown" or self.auto_lock:
+            self.drives.lock_all()
+            self.drives.refresh()
+
     def closeEvent(self, e):
-        self.drives._stop_mount()
+        self.drives.lock_all()
         super().closeEvent(e)
 
 
@@ -499,8 +450,10 @@ def main():
     )
     app = QApplication(sys.argv)
     setTheme(Theme.AUTO)
-    setThemeColor(QColor("#13b3a4"))  # cloak teal accent
+    setThemeColor(QColor("#13b3a4"))
     w = Cloak()
+    install_power_hook(app, w.on_power)
+    app.aboutToQuit.connect(w.drives.lock_all)
     w.show()
     sys.exit(app.exec())
 

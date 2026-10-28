@@ -1,2 +1,4 @@
 PySide6
 PySide6-Fluent-Widgets
+# macOS only: lets the app auto-lock drives when the Mac goes to sleep.
+pyobjc-framework-Cocoa; sys_platform == "darwin"
