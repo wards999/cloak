@@ -105,6 +105,29 @@ def free_drive_letters():
     return [f"{c}:" for c in "DEFGHIJKLMNOPQRSTUVWXYZ" if f"{c}:" not in used]
 
 
+def winfsp_bin():
+    """Directory holding winfsp-x64.dll. It isn't on PATH by default, so the
+    mount adapter fails to load it with STATUS_DLL_NOT_FOUND; we add it to the
+    adapter's environment. Returns None if not found (non-Windows, or no WinFsp)."""
+    if not IS_WIN:
+        return None
+    try:
+        import winreg
+        for key in (r"SOFTWARE\WOW6432Node\WinFsp", r"SOFTWARE\WinFsp"):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
+                    inst, _ = winreg.QueryValueEx(k, "InstallDir")
+                    p = os.path.join(inst, "bin")
+                    if os.path.isdir(p):
+                        return p
+            except OSError:
+                continue
+    except Exception:
+        pass
+    default = r"C:\Program Files (x86)\WinFsp\bin"
+    return default if os.path.isdir(default) else None
+
+
 def load_drives():
     try:
         return json.loads(CONFIG.read_text())
@@ -398,6 +421,9 @@ class DrivesInterface(QWidget):
 
         adapter = _find("cloak-winmount" if IS_WIN else "cloak-mount")
         env = os.environ.copy(); env["CLOAK_PASSPHRASE"] = pw
+        wb = winfsp_bin()
+        if wb:
+            env["PATH"] = wb + os.pathsep + env.get("PATH", "")
         try:
             proc = subprocess.Popen([adapter, drive["path"], mp], stdin=subprocess.PIPE, env=env)
         except OSError as e:
